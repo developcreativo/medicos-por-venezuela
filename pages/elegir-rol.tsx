@@ -1,8 +1,12 @@
-import Head from 'next/head'
+import Seo from '../components/Seo'
 import { useRouter } from 'next/router'
 import { useEffect, useState } from 'react'
 import { supabase } from '../lib/supabase'
-import { SPECIALTIES } from '../lib/utils'
+import { fetchMyProfile } from '../lib/consultations'
+import { finalizeMyRole } from '../lib/users'
+import { fetchSpecialties, type SpecialtyResponse } from '../lib/doctors'
+import { isAdminRole } from '../lib/utils'
+import AceptaTerminos, { MENSAJE_TERMINOS } from '../components/AceptaTerminos'
 
 const PAISES = [
   'Venezuela',
@@ -24,17 +28,25 @@ const PAISES = [
 ]
 
 // First-time role picker for accounts created via Google (OAuth can't carry a trusted role).
-// Calls the set_my_role RPC, which finalizes the profile exactly once and can never grant admin.
+// Calls POST /profiles/me/finalize-role (backend), which finalizes the profile exactly once and
+// can never grant admin.
 export default function ElegirRol() {
   const router = useRouter()
   const [checking, setChecking] = useState(true)
   const [choice, setChoice] = useState<'' | 'patient' | 'doctor'>('')
   // True when the role was pre-selected from registration intent — hides the "Volver" choice toggle.
   const [locked, setLocked] = useState(false)
+  // El ID del catálogo, no el nombre: se envía como `specialty_id` y es la FK con la que el
+  // backend decide qué puede atender este médico. Ya no hay fallback a una lista hardcodeada —
+  // sin catálogo no se puede producir un id válido, así que se avisa en vez de inventar uno.
   const [specialty, setSpecialty] = useState('')
+  const [specialtyOptions, setSpecialtyOptions] = useState<SpecialtyResponse[]>([])
   const [country, setCountry] = useState('')
   const [license, setLicense] = useState('')
   const [whatsapp, setWhatsapp] = useState('')
+  // Quien entra con Google termina su alta AQUÍ, sin pasar por /registro-paciente ni
+  // /registro-medico: sin esta casilla, sería la única puerta a una cuenta sin aceptar los términos.
+  const [terminos, setTerminos] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
@@ -47,15 +59,16 @@ export default function ElegirRol() {
         router.replace('/')
         return
       }
-      // If the role was already chosen, don't show this screen again.
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('role, role_chosen')
-        .eq('id', session.user.id)
-        .single()
-      if (profile?.role_chosen) {
-        redirectByRole(profile.role)
-        return
+      // If the role was already chosen, don't show this screen again. El perfil viene del backend
+      // (/auth/me); si la llamada falla, se muestra el formulario de elección (fallback seguro).
+      try {
+        const profile = await fetchMyProfile(session.access_token)
+        if (profile.role_chosen) {
+          redirectByRole(profile.role)
+          return
+        }
+      } catch {
+        // sin perfil del backend, seguimos y mostramos el formulario
       }
 
       // Pre-select the form when the intent is known (email redirect ?rol= or Google localStorage).
@@ -74,21 +87,32 @@ export default function ElegirRol() {
       setChecking(false)
     }
     run()
+    fetchSpecialties()
+      .then((list) => setSpecialtyOptions(list.filter((s) => s.status === 'active')))
+      .catch(() => setError('No se pudo cargar el catálogo de especialidades.'))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   function redirectByRole(role: string) {
-    if (['admin', 'super_admin'].includes(role)) router.replace('/admin/dashboard')
+    if (isAdminRole(role)) router.replace('/admin/dashboard')
     else if (['doctor', 'specialist'].includes(role)) router.replace('/panel-medico')
     else router.replace('/registro-paciente')
   }
 
   const confirmPatient = async () => {
     setError('')
+    if (!terminos) {
+      setError(MENSAJE_TERMINOS)
+      return
+    }
     setLoading(true)
     try {
-      const { error: rpcError } = await supabase.rpc('set_my_role', { p_role: 'patient' })
-      if (rpcError) throw rpcError
+      const {
+        data: { session }
+      } = await supabase.auth.getSession()
+      if (!session) throw new Error('Sesión expirada')
+      // POST /profiles/me/finalize-role (backend) — reemplaza la RPC set_my_role.
+      await finalizeMyRole({ role: 'patient' }, session.access_token)
       router.replace('/registro-paciente')
     } catch (e) {
       console.error(e)
@@ -103,16 +127,27 @@ export default function ElegirRol() {
       setError('Completa especialidad, país y WhatsApp.')
       return
     }
+    if (!terminos) {
+      setError(MENSAJE_TERMINOS)
+      return
+    }
     setLoading(true)
     try {
-      const { error: rpcError } = await supabase.rpc('set_my_role', {
-        p_role: 'doctor',
-        p_specialty: specialty,
-        p_country: country,
-        p_medical_license: license.trim() || null,
-        p_whatsapp_number: whatsapp.trim()
-      })
-      if (rpcError) throw rpcError
+      const {
+        data: { session }
+      } = await supabase.auth.getSession()
+      if (!session) throw new Error('Sesión expirada')
+      // POST /profiles/me/finalize-role (backend) — reemplaza la RPC set_my_role.
+      await finalizeMyRole(
+        {
+          role: 'doctor',
+          specialty_id: specialty,
+          country,
+          medical_license: license.trim() || null,
+          whatsapp_number: whatsapp.trim()
+        },
+        session.access_token
+      )
       router.replace('/panel-medico')
     } catch (e) {
       console.error(e)
@@ -121,20 +156,39 @@ export default function ElegirRol() {
     }
   }
 
+  // El `noindex` se declara ANTES del return temprano de carga, y no solo dentro del arbol final.
+  // En el servidor el estado inicial es siempre "cargando", asi que el HTML que recibe un crawler
+  // es SIEMPRE esa pantalla. Con el <Seo> unicamente en la rama de abajo, esa respuesta salia con
+  // el <head> vacio: sin `noindex`, sin `<title>` y con un 200. El `Disallow` de robots.txt pide
+  // que no se rastree, pero una URL enlazada desde fuera puede acabar indexada igualmente --el
+  // propio comentario de robots.txt explica por que hacen falta las dos senales-- y estas rutas
+  // no tienen gate en servidor: responden 200 y el control de acceso llega tras la hidratacion.
+  const seo = (
+    <Seo
+      titulo="Elegir rol — Médicos por Venezuela"
+      descripcion={
+        'Paso final del registro con Google: elige si entras como paciente o como médico.'
+      }
+      ruta="/elegir-rol"
+      noindex
+    />
+  )
+
   if (checking)
     return (
-      <main className="page">
-        <div className="narrow">
-          <div className="card">Cargando...</div>
-        </div>
-      </main>
+      <>
+        {seo}
+        <main className="page">
+          <div className="narrow">
+            <div className="card">Cargando...</div>
+          </div>
+        </main>
+      </>
     )
 
   return (
     <>
-      <Head>
-        <title>Elegir rol — Médicos por Venezuela</title>
-      </Head>
+      {seo}
       <main className="page">
         <div className="narrow">
           <div className="card" style={{ marginTop: 14 }}>
@@ -171,6 +225,7 @@ export default function ElegirRol() {
                 <div className="notice notice-info">
                   Tu cuenta quedará como paciente. Luego podrás registrar tu solicitud.
                 </div>
+                <AceptaTerminos checked={terminos} onChange={setTerminos} />
                 {error && <div className="notice notice-danger">{error}</div>}
                 <button
                   className="btn btn-primary btn-full"
@@ -198,9 +253,9 @@ export default function ElegirRol() {
                     <label className="label">Especialidad *</label>
                     <select value={specialty} onChange={(e) => setSpecialty(e.target.value)}>
                       <option value="">Selecciona...</option>
-                      {SPECIALTIES.map((s) => (
-                        <option key={s} value={s}>
-                          {s}
+                      {specialtyOptions.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.name}
                         </option>
                       ))}
                     </select>
@@ -238,6 +293,7 @@ export default function ElegirRol() {
                     </div>
                   </div>
                 </div>
+                <AceptaTerminos checked={terminos} onChange={setTerminos} />
                 {error && <div className="notice notice-danger">{error}</div>}
                 <button
                   className="btn btn-primary btn-full"

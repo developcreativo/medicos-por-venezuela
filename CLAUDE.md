@@ -11,26 +11,31 @@ case oversight.
 
 ## Testing capabilities (strict_tdd: false)
 
-**There is still no automated test harness (unit/integration/E2E) in this repo.** Lint and format
-ARE now enforced (ESLint + Prettier) — only `test` tooling is missing:
+**E2E exists; unit/integration still don't.** Lint and format are enforced (ESLint + Prettier):
 
-- `package.json` scripts: `dev`, `build`, `start`, `lint`, `format`, `format:check` — no `test` script
-- Zero matches for `**/*.test.*` or `**/*.spec.*`
+- `package.json` scripts: `dev`, `build`, `start`, `lint`, `format`, `format:check`, `test:e2e`
+- E2E: Playwright (`playwright.config.ts`, specs in `e2e/`) against the local stack —
+  needs Docker + local Supabase + the FastAPI backend; `e2e/global-setup.ts` seeds the test accounts
+- No unit/integration specs (`**/*.test.*`) yet
 - CI runs lint + build on PRs (`.github/workflows/ci.yml`) but has no test step
 
 | Layer        | Available | Tool / Command                                 |
 | ------------ | --------- | ---------------------------------------------- |
 | Unit         | ❌        | —                                              |
 | Integration  | ❌        | —                                              |
-| E2E          | ❌        | —                                              |
+| E2E          | ✅        | `pnpm test:e2e` (Playwright, `e2e/`)           |
 | Linter       | ✅        | `pnpm lint` (ESLint, `eslint-config-next`)     |
 | Type checker | ✅ manual | `pnpm exec tsc --noEmit` (no dedicated script) |
 | Formatter    | ✅        | `pnpm format` / `pnpm format:check` (Prettier) |
 | Coverage     | ❌        | —                                              |
 
-Verification after a change means `pnpm build`, `pnpm exec tsc --noEmit`, `pnpm lint`, and manual
-QA in the browser — there is no automated test suite to run or extend. Recommendation (not yet
-actioned): add Vitest + React Testing Library and a `test` script before enabling Strict TDD mode.
+Verification after a change means `pnpm build`, `pnpm exec tsc --noEmit`, `pnpm lint`, `pnpm test:e2e`,
+and manual QA in the browser. Recommendation (not yet actioned): add Vitest + React Testing Library
+and a unit `test` script before enabling Strict TDD mode.
+
+> **Ojo:** no lances `pnpm build` con un `next dev` corriendo sobre el mismo directorio — se pisan
+> el `.next` y el dev server empieza a servir chunks rotos (React no hidrata). Los E2E ya lo
+> evitan con `NEXT_DIST_DIR=.next-e2e`; para un build manual, usa esa misma variable o para el dev.
 
 ## Contribution standards
 
@@ -39,6 +44,51 @@ hook); a `pre-commit` hook runs `lint-staged` (ESLint --fix + Prettier) on stage
 install automatically on `pnpm install` via the `prepare` script. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, and
 [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md) for the PR format.
+
+### Change log protocol
+
+**Every time a task is finished, update [changeslog.md](changeslog.md)** as
+the final step. Add a short entry at the top (newest first) — one or two lines on what changed and
+why, plus the key files/areas touched — grouping same-day work under a single `## YYYY-MM-DD`
+heading. This is the running history of the project; keep entries concise and factual.
+
+**Tras un rebase, re-audita la entrada del changelog de esa rama**: si un fix del PR quedó
+supersedido por la base (la base ya lo traía, o lo reemplazó por algo mejor), la entrada ya no
+debe atribuírselo — deja una "nota del rebase" con qué se descartó y por qué. Un changelog que
+promete cambios que el diff ya no contiene es un bug de documentación (lección del review
+2026-07-14).
+
+### Lecciones de code review (reglas de diseño, cumplimiento estricto)
+
+- **Realtime + `setState`: SIEMPRE functional updates** (`setX(prev => …)`) en páginas con
+  suscripción Realtime. Un `setX({ ...objetoCapturado, campo })` después de un `await` pisa lo
+  que Realtime aplicó durante la espera (p.ej. un cierre hecho por un admin en paralelo).
+- **Finalizar/tomar estados contra Supabase = escritura condicional.** Ocultar el botón
+  (`isCaseClosed`) es solo render: la escritura debe filtrar por el estado esperado
+  (`.not('status', 'in', '(…estados finales…)')` + `.select()`, tratando 0 filas como "otro
+  ganó"). Ojo: `window.confirm` bloquea el event loop y ENCOLA los mensajes Realtime — al
+  aceptar, tu estado local puede estar viejo aunque "acabes de mirarlo".
+- **Modales: usa el `ConfirmDialog` compartido** (`components/admin/ConfirmDialog.tsx`), que ya
+  trae Escape + foco inicial. No introduzcas `window.confirm` nuevos ni diálogos inline
+  copiados; si reemplazas un `window.confirm`, el reemplazo debe conservar su accesibilidad
+  nativa (Escape, foco), no perderla.
+- **Un estado de error por fuente.** Si dos fetches comparten un `error` state, el
+  `setError('')` de uno borra el aviso del otro. Cada fallo con recuperación distinta (lista vs
+  catálogos del pool, p.ej.) lleva su propio estado.
+- **Todo gating de UI nuevo (p.ej. "caso finalizado") nace con su spec E2E** en `e2e/`. Los
+  specs existentes cubren flujos felices; un gating sin spec se rompe en silencio en el
+  siguiente refactor.
+
+## Skills locales y módulo de mensajería (2026-09-29)
+
+Skills de trabajo en `.claude/skills/`: `nueva-funcionalidad` (spec → plan → todo → código →
+verificación → changeslog), `corregir-bug` (reproducir → E2E que falla → fix mínimo) y
+`mensajeria` (contexto del buzón médico ↔ paciente). El encargo de mensajería vive en
+`tasks/mensajeria-medico-paciente/` (UI) y, como spec canónica, en
+`../api-medicos-por-venezuela/tasks/mensajeria-medico-paciente/`; el contexto del cliente en
+`.knowledge/mensajeria.md`. Correcciones detectadas y aún no autorizadas:
+`tasks/backlog-correcciones.md` (incluye el drift de esta documentación: el stack real es
+Next 16 / React 19 / TypeScript 6 sobre AWS Amplify, y todo dato va por la API).
 
 ## SDD (Spec-Driven Development) setup
 
@@ -59,32 +109,90 @@ Recover via `mem_search(query: "{topic_key}", project: "medicos-por-venezuela")`
 - **Patients:** can submit a request **anonymously** (default). An account is **optional** — only for
   patients who want to follow their case at `/mi-caso`. When created, the `patients` row links to the
   auth user via `user_id`.
-- **Doctors:** self-register (email+password or Google) with **instant access** (`verified` + `active`
-  set on signup). Admins can **revoke** a doctor anytime by setting `active = false` (instant cutoff
-  via `current_user_role()`).
-- **Admins:** promoted manually via SQL. Private login at `/admin` (not linked from the landing page);
+- **Doctors:** self-register (email+password only — Google sign-up was removed from `/registro-medico`)
+  with **instant access** (`verified` + `active` set on signup). Admins can **revoke** a doctor anytime
+  by setting `active = false` (instant cutoff via `current_user_role()`). Separately, the SACS/FPV
+  credential check now lives in the dedicated backend (see Architecture below) as a `doctors` row —
+  that row has no relationship to the `profiles`/auth account created here; they're linked only by
+  matching email.
+- **Admins:** promoted manually via SQL. Sign in at `/login` like everyone else (`/admin` is now just a redirect);
   manage cases (reassign doctor, change status, edit note) from `/admin/dashboard`.
+- **Una cuenta de Auth sin registro no entra.** `resolvePostLoginRoute` (`lib/postLogin.ts`) bloquea
+  —y cierra la sesión— a quien no es admin y no tiene detrás una ficha viva en `doctors` ni un
+  paciente vivo en `patients` (`has_account_record` de `GET /auth/me`). En producción había cuentas así
+  (2026-09-14): el registro de médico crea la cuenta y DESPUÉS la ficha, y si la ficha fallaba (p. ej.
+  un médico ya registrado probando con otro correo) la cuenta quedaba sola y entraba al sitio.
+  - Va DESPUÉS de `role_chosen`: quien entra con Google por primera vez termina el alta en esa sesión
+    (elegir rol → completar ficha o solicitud). Si se va sin terminar, el siguiente login lo bloquea.
+  - El admin va antes del chequeo: no necesita registro.
+  - Salida del bloqueo para un médico: volver a `/registro-medico` con el mismo correo y contraseña.
+    `POST /doctors/registration-check` lo reconoce como `incomplete` y el formulario entra con esa
+    cuenta (`signInWithPassword`) en vez de crear otra. Una cuenta cuya ficha dio de baja un admin NO
+    es `incomplete`: registrarse otra vez desharía la baja.
+  - Fijado por `e2e/cuenta-sin-registro.spec.ts`.
 - **Google sign-in:** OAuth can't carry a role, so a first-time Google user gets a placeholder profile
   (`role_chosen = false`) and is routed to `/elegir-rol` to pick patient vs doctor. The choice is
-  finalized by the `set_my_role` RPC, which can never grant admin/specialist.
+  finalized by the `set_my_role` RPC, which can never grant admin/specialist. A Google user who picks
+  **doctor** still has no cédula/`doctors` row (a `source:"user"` profile from `/doctors/me`): on
+  entering `/panel-medico` they're **auto-redirected to `/panel-medico/perfil`** to complete it —
+  they pick their professional type, enter their cédula (verified live against SACS/FPV, then again
+  server-side on save via `PATCH /doctors/me`), and the backend creates their `doctors` row.
 - **`handle_new_auth_user()`** reads `role` (+ doctor fields) from signup metadata; email signups are
   finalized immediately, OAuth signups stay `role_chosen = false`.
 - **Prereq:** Supabase → Auth → Email "Confirm email" must be **OFF** (instant access + same-session
   patient insert), the Google provider enabled, and `/auth/callback` in the redirect allow-list.
+  **The allow-list is per host and the canonical host is now the apex** (`https://medicosporvenezuela.org/**`):
+  it only had `www`, and `lib/auth.ts` builds `redirectTo` from `window.location.origin`, so Google
+  sign-in from the apex sent users back to the Site URL without a session. `/auth/recuperar` needs
+  to be reachable under the same allow-listed host.
 - The legacy `doctor_applications` table has been **retired/dropped**.
+
+### Las dos columnas `verified` (no las confundas)
+
+Hay dos, se llaman igual y significan cosas distintas. Confundirlas ya causó un bug: la lista de
+médicos del admin mostraba a **todos** como "Verificado", incluidos los 795 (de 2955) cuya cédula
+no validó.
+
+| Columna            | Qué significa                                                                                                             | Quién la escribe                                           |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `users.verified`   | **Gancho reservado, hoy inerte.** Nace `true` en `handle_new_auth_user` y **ninguna ruta del backend la pone en `false`** | Solo `finalize_role`, y solo a `true`                      |
+| `doctors.verified` | El dato real: la cédula validó contra **SACS** (médico) o **FPV** (psicólogo)                                             | `_verify_credential()` al registrar y al cambiar la cédula |
+
+**Regla:** cualquier UI o lógica que hable de "verificado" en el sentido de credencial profesional
+lee `doctors.verified`. `users.verified` no debe decidir ni mostrarse; comprobarla es evaluar una
+constante.
+
+El admin lo ve vía `doctor_verified` en `GET /profiles` (LEFT JOIN a `doctors`, `null` = esa
+persona no tiene ficha). Fijado por `e2e/admin-cedula-verificada.spec.ts`.
+
+`users.verified` **no se borra**: `current_user_role()` sigue filtrando por ella, así que el gancho
+de aprobación previa (ver Security notes) funcionaría poniéndola en `false` sin tocar RLS.
 
 ## Architecture (important)
 
-There is **no separate backend server**. This is a **Next.js frontend + Supabase BaaS**:
+This used to be a **Next.js frontend + Supabase BaaS only** app. That's now **partially true** —
+migration to a dedicated backend is in progress:
 
-- The Next.js app (at the repo root) runs entirely client-side against Supabase.
-- "The backend" = a **Supabase project** providing Postgres, Auth, and Row Level Security.
-- Most data access goes directly from the browser through the Supabase JS client using the
-  **anon key** + RLS; logic lives in RLS policies + Postgres functions/triggers in
-  [supabase_schema.sql](supabase_schema.sql).
-- One server-side **API route** exists: `pages/api/videoconsulta.ts` (Vercel serverless function).
-  It uses the Twilio + Supabase **service-role** secrets, which must stay server-only — see
-  [lib/supabaseAdmin.ts](lib/supabaseAdmin.ts) (imported only by API routes).
+- **Auth stays on Supabase**: `supabase.auth.signUp()`/`getSession()` run directly from the browser
+  against a Supabase project (anon key). Identity/session issuance has not moved.
+- **A separate FastAPI backend now exists** (`api-medicos-por-venezuela`, sibling repo) and owns
+  doctor registration, patient registration, and consultation creation: `pages/registro-medico.tsx`
+  and `pages/registro-paciente.tsx` call it directly via `lib/doctors.ts`/`lib/patients.ts`
+  (`POST /api/v1/doctors`, `POST /api/v1/patients`, `POST /api/v1/consultations`), base URL from
+  `NEXT_PUBLIC_API_URL` (see `.env.example`). It also serves the **doctor self-service profile**
+  (`/panel-medico/perfil` via `GET`/`PATCH /api/v1/doctors/me`, resolved from the Supabase JWT —
+  no id sent, IDOR-safe) and the médico pool (`GET /api/v1/doctors/pool`). That backend connects to
+  its own Postgres as owner (bypasses Supabase RLS) and does its own rate-limiting/anti-bot/RBAC —
+  see its own CLAUDE.md. The shared REST client is [lib/apiClient.ts](lib/apiClient.ts) (Supabase
+  JWT as `Authorization: Bearer`, `ApiError` carrying `.status`, Pydantic-`422` message flattening).
+- **Everything else** (queue/panel-medico, admin dashboard, `/mi-caso`, specialty/zone catalog
+  fallbacks in `lib/api.ts`) still goes directly from the browser through the Supabase JS client
+  using the **anon key** + RLS; logic lives in RLS policies + Postgres functions/triggers in
+  [supabase_schema.sql](supabase_schema.sql). Auditing RLS policies alone no longer tells the full
+  story for doctor/patient/consultation writes — check the FastAPI repo's own security rules too.
+- One server-side **API route** exists in this repo: `pages/api/videoconsulta.ts` (Vercel serverless
+  function). It uses the Twilio + Supabase **service-role** secrets, which must stay server-only —
+  see [lib/supabaseAdmin.ts](lib/supabaseAdmin.ts) (imported only by API routes).
 
 ## Tech stack
 
@@ -100,12 +208,14 @@ There is **no separate backend server**. This is a **Next.js frontend + Supabase
 
 ## Services used
 
-| Service    | Role                                                                  |
-| ---------- | --------------------------------------------------------------------- |
-| Supabase   | Database (Postgres), authentication, RLS authorization                |
-| Vercel     | Hosting, environment variables, serverless API routes                 |
-| Twilio     | (PARKED — compliance pending) would send video links via WhatsApp/SMS |
-| Jitsi Meet | Free in-browser video rooms (`meet.jit.si`, no server/keys)           |
+| Service            | Role                                                                                                                                                                                                                                                                          |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Supabase           | Database (Postgres), authentication, RLS authorization                                                                                                                                                                                                                        |
+| FastAPI API        | Separate backend (`api-medicos-por-venezuela`) — REST `/api/v1/*`; doctor self-profile + SACS/FPV verification                                                                                                                                                                |
+| Vercel             | Hosting, environment variables, serverless API routes                                                                                                                                                                                                                         |
+| Twilio             | (PARKED — compliance pending) would send video links via WhatsApp/SMS                                                                                                                                                                                                         |
+| Jitsi Meet         | In-browser video rooms on our **self-hosted** instance `meet.medicosporvenezuela.org` (open rooms, no moderator login; public `meet.jit.si` now requires one)                                                                                                                 |
+| Google Analytics 4 | Property `G-09M01TF5F3`. Loaded **only** on the production domain: the inline snippet in `pages/_document.tsx` checks the hostname before it even creates the `<script>`, so local and branch previews issue no request to Google. No npm dependency — see `lib/analytics.ts` |
 
 ## Project layout
 
@@ -113,8 +223,14 @@ The Next.js app lives at the **repo root** (so Vercel builds with default settin
 
 - `pages/` — routes (see below)
 - `lib/supabase.ts` — Supabase client (reads `NEXT_PUBLIC_*` env vars)
+- `lib/apiClient.ts` — FastAPI REST client (`NEXT_PUBLIC_API_URL`, Supabase JWT as Bearer, `ApiError`)
+- `lib/doctors.ts` — doctor REST endpoints (`/doctors/me` self-profile, specialties catalog)
+- `lib/reports.ts` — reports REST client (preview + `.xlsx` download; super_admin only)
+- `lib/marketing.ts` — marketing surveys REST client (public submit + super_admin list/`.xlsx`)
 - `lib/auth.ts` — `signInWithGoogle()` OAuth helper (redirects to `/auth/callback`)
-- `lib/utils.ts` — status labels, specialty list, specialty↔needs matching (`matchesSpecialty`, `canAttend`)
+- `lib/utils.ts` — status labels y helpers de presentación (`tiempoTranscurrido`,
+  `statusBadgeClass`); el matching de especialidades lo decide la API, no el cliente
+- `lib/waitingRoom.ts` — sala de espera en vivo del paciente (SSE + respaldo JSON)
 - `components/` — shared UI (e.g. `GoogleButton.tsx`)
 - `supabase_schema.sql` — **the backend**: tables, triggers, RLS policies, RPCs (run in Supabase)
 
@@ -122,16 +238,86 @@ The Next.js app lives at the **repo root** (so Vercel builds with default settin
 
 - `/` — home (two cards: paciente / médico; no admin link)
 - `/registro-paciente` — patient request form (public; optional account + Google)
-- `/sala-espera` — patient confirmation (anonymous submissions)
-- `/registro-medico` — doctor self-registration (email+password or Google)
+- `/sala-espera` — patient waiting room, **live** (`lib/waitingRoom.ts`: SSE from
+  `GET /consultations/{id}/waiting-room/stream`, JSON fallback). "Entrar a la videoconsulta" only
+  appears once a doctor has taken the case; it follows the case if it was derived. The room token
+  (`?t=`) is moved to sessionStorage and removed from the URL
+- `/registro-medico` — doctor self-registration (email+password). **Antes de crear la cuenta en
+  Supabase Auth** pregunta a `POST /doctors/registration-check`: al salir del campo de correo (si ya
+  es de un médico, `YaRegistradoModal` con dos enlaces: "inicie sesión" → `/login` y "pida recordar
+  su clave" → `/auth/recuperar`) y otra vez al enviar, con la cédula. Sin esto, un correo o una cédula
+  ya registrados creaban la cuenta y fallaban al guardar la ficha. Fijado por
+  `e2e/registro-medico-correo.spec.ts` (ningún spec envía el formulario: el alta manda correos reales)
 - `/elegir-rol` — first-time Google role picker (patient vs doctor)
-- `/mi-caso` — patient login + read-only case status
-- `/login-medico` — doctor login
-- `/panel-medico` — doctor/admin panel (queue, active system cases for admin, counters)
-- `/panel-medico/consulta/[id]` — case detail page (patient details, video, note, close/no-show)
+- `/legal/privacidad` — public, indexable Terms of use and privacy page (linked from the footer).
+  `/registro-paciente`, `/registro-medico` and `/elegir-rol` require ticking
+  `components/AceptaTerminos.tsx`, which opens this page in a new tab. The acceptance is enforced
+  client-side only (not yet stored by the backend). Every claim on the page is a legal commitment:
+  a new provider or a new form field means updating the text and its date
+  (`e2e/terminos.spec.ts`)
+- `/login` — **single sign-in for patients, doctors and admins**; routes by effective role
+  (`lib/postLogin.ts`, shared with `/auth/callback` and `/mi-caso`)
+- `/mi-caso` — patient portal, read-only case status (no login form; sends you to `/login`). Open
+  cases show the same live waiting room as `/sala-espera` (`components/SalaEsperaEnVivo.tsx`)
+- `/login-medico` — legacy doctor login, redirects to `/login`
+- `/panel-medico` — doctor/admin panel, full width. The queue is **per specialty** (decided by the
+  API, `services/queue_access.py`). A specialist gets **one queue per specialty they practise**
+  (they can have several) plus the triage one (Medicina general), shown as cards with counts
+  before the list — the panel just renders `queues[]` from the API. With a single queue (a general
+  practitioner, Psicología, an admin who doesn't practise) there are no cards. An admin who _does_
+  practise gets their own queues plus a last `is_rest` card ("otras especialidades") holding
+  everything else they can see, computed by elimination. Cards offer "Atender paciente" (always
+  video) and "Derivar a especialista". Doctors with "Otra" or no specialty get a notice pointing
+  to their profile
+- `/panel-medico/consulta/[id]` — case detail page (patient details, video, note, close/no-show, chat block with attachments)
+- `/panel-medico/mensajes` — doctor unified inbox (active message threads with patient presence indicators, unread counters, and filtering)
+- `/panel-medico/perfil` — doctor self-service profile (view/edit; FastAPI `GET`/`PATCH /doctors/me`).
+  **Especialidades** is a checkbox list (several allowed, first one is the primary → `specialty_ids`)
+  plus a separate "Otra: mi especialidad no está en la lista" with a free-text field;
+  also where a `source:"user"` (Google) doctor completes their cédula + professional type to be verified
 - `/auth/callback` — OAuth redirect handler (routes by role / role_chosen)
-- `/admin` (+ `/admin/login` alias) — private admin login
+- `/auth/recuperar` — password recovery, **both halves in one route**: with no token in the URL
+  fragment it asks for the email (`resetPasswordForEmail`); with one, it sets the session and asks
+  for the new password (`updateUser`). Google accounts have no password here, so the request form
+  says so instead of trying to detect it — detecting it would leak which emails have an account
+- `/admin` (+ `/admin/login` alias) — legacy admin entrance, redirects to `/login` (still `noindex`)
 - `/admin/dashboard` — admin dashboard (metrics, doctor revoke, case oversight)
+- `/admin/doctores` — two tabs: **Todos los doctores** (the staff accounts table, with the
+  specialties each one practises and a filter by specialty resolved server-side against
+  `doctor_specialties`) and **Doctores por aprobar** (`components/admin/DoctorCredentials.tsx`,
+  the credential inbox)
+- `/admin/pacientes` — cases table. The "Especialidad / motivo" column shows the case's CURRENT
+  specialty (`consultations.specialty_id`, the new one if it was derived), not the `category` the
+  patient picked when registering, which never changes
+- `/admin/reportes` — **super_admin only**: filterable listing reports of doctors and patients,
+  exported to Excel. The table is rendered generically from the `columns` the backend sends
+  (`GET /api/v1/reports/{doctors,patients}`), so the preview and the `.xlsx` can never show
+  different columns; the download goes through `lib/reports.ts` (fetch + blob, because the
+  endpoint needs the JWT in a header and an `<a href>` can't send one). An `admin` gets a notice
+  instead of the page and doesn't see the sidebar link — the backend gates it with the
+  `reports.export` permission, seeded for `super_admin` alone, and audits every export
+- `/encuesta/psicologos`, `/encuesta/especialistas`, `/encuesta/medicos-generales` — **public**
+  marketing surveys (`noindex`, disallowed in robots) reached from mass emails sent with Kit. The
+  link carries the recipient's email (`?email={{ subscriber.email_address }}`), shown read-only;
+  without it the field becomes editable. One component for the three
+  (`components/marketing/EncuestaForm.tsx`, copy and option codes in `encuestas.ts`); submits to
+  `POST /api/v1/marketing/surveys/{slug}/responses`, and answering again with the same email
+  replaces the previous answer. The email is **not verified**, and it's stripped from what GA4
+  receives (`PARAMS_PRIVADOS` in `lib/analytics.ts`), since `page_location` carries the query
+- `/admin/marketing` — **super_admin only** (`marketing.read`): one tab per survey (Psicólogos,
+  Especialistas, Médico General), each labelled with its response count from
+  `GET /marketing/surveys`, with the responses list, email/date filters and `.xlsx` export — it
+  reuses Reportes' generic table (`components/admin/ReportTable.tsx`). A fourth tab, **Gráficos**,
+  is the campaign dashboard (`components/admin/marketing/`), scoped to all surveys or one:
+  - **Embudo de la campaña** (`GET /marketing/performance`): sent → opened → clicked → responded,
+    joining Kit broadcast metrics with the platform's responses. The backend reads Kit with
+    `KIT_API_KEY`; without it, or with Kit down, only the responses show. Every rate states its
+    denominator, and the response rate only counts responses after the first send.
+  - **Respuestas desde el envío**: a cumulative SVG time series with send markers, keyboard
+    navigable.
+  - **Qué respondieron** (`GET /marketing/surveys/{slug}/stats`): day × moment heatmap (fixed,
+    contrast-checked levels), roles, weekly hours and location, filterable by date and role.
+  - Plain HTML/CSS/SVG, no chart library.
 
 ## Database (Supabase Postgres)
 
@@ -148,11 +334,21 @@ Postgres functions / RPCs:
 - `handle_new_auth_user()` — trigger; creates a `profiles` row from signup metadata (role-aware)
 - `set_my_role(...)` — RPC; lets a user finalize their own profile once (patient/doctor only)
 - `current_user_role()`, `is_admin()`, `is_staff()` — RLS helpers
-- `mark_myself_online()` — RPC doctors call to update `last_seen_at` (granted to `authenticated`)
-- `mark_patient_waiting(uuid)` — RPC called by `/sala-espera` to update `patient_last_seen_at`
+- `mark_myself_online()` — **legacy/vestigial**: doctor online status now uses Supabase Realtime
+  **Presence** (`lib/presence.tsx`, channel `online-doctors`), no DB writes. Nobody calls this RPC
+  anymore (cleanup pending); do not base new logic on `profiles.last_seen_at`.
+- `mark_patient_waiting(uuid)` — **legacy/vestigial**: patient presence is Realtime Presence too
+  (`lib/patientPresence.tsx`); nobody calls this RPC anymore
 
-RLS is enabled on all tables. Anon can INSERT patients/consultations; account-holding patients read
-their own rows; staff read all; admins manage.
+RLS is enabled on all tables. **Desde 2026-09-14 (migración del backend `20260914_111456`) la RLS dice
+lo mismo que la API:** nadie lee `patients` ni `consultation_events` por PostgREST (sin policies ni
+SELECT para `authenticated`); de `consultations`, `authenticated` solo tiene SELECT en `id`, `status` y
+`assigned_doctor_id` — la señal que usan los canales Realtime del panel y del detalle, que respetan
+privilegios por columna. Staff = `current_user_role()`, que a un médico le exige ficha habilitada
+(`public.doctor_can_practice`, espejo de `has_valid_credential`). El paciente con cuenta ve sus
+consultas (`public.owns_patient`). Todos los datos de pacientes van por la API, que valida pertenencia.
+Antes cualquier cuenta con `users.role = 'doctor'` —con ficha o sin ella— leía todos los pacientes con
+el anon key.
 
 ## Getting started (the backend = Supabase)
 
@@ -172,7 +368,7 @@ The "backend" is provisioned entirely in Supabase — there is no local server t
        full_name = 'Administrador principal'
    where email = 'YOUR_EMAIL@example.com';
    ```
-   Then log in at `/admin`.
+   Then log in at `/login` — the single sign-in routes an admin to `/admin/dashboard`.
 5. **Get API keys**: Supabase → Project Settings → API → copy the Project URL and anon key.
 
 ### Run the frontend locally
@@ -197,33 +393,49 @@ Browser-exposed (`NEXT_PUBLIC_*`, fine — RLS enforces access):
 
 - `NEXT_PUBLIC_SUPABASE_URL`
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+- `NEXT_PUBLIC_API_URL` — base URL of the FastAPI backend (`/api/v1/*`); defaults to
+  `http://localhost:8000` if unset
 
-Server-only (used by `pages/api/videoconsulta.ts`; **never** prefix with `NEXT_PUBLIC`):
+Server-only (**never** prefix with `NEXT_PUBLIC`, and **never** set them in Amplify — no runtime
+code reads them since `pages/api/videoconsulta.ts` was removed):
 
-- `SUPABASE_SERVICE_ROLE_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY` — local `.env` only; `e2e/global-setup.ts` uses it to seed the test
+  doctors against the LOCAL Supabase (never prod). Without it, `pnpm test:e2e` fails.
 - `TWILIO_*` (PARKED — see TODOs; not needed while link delivery is on-screen only)
 
 ## Video consultations (Jitsi)
 
-Patient self-service flow: a patient submits a request → [registro-paciente.tsx](pages/registro-paciente.tsx)
-POSTs to [pages/api/videoconsulta.ts](pages/api/videoconsulta.ts), which generates a Jitsi room
-([lib/jitsi.ts](lib/jitsi.ts)) and stores it on `consultations.video_room_url`. The patient lands on
-`/sala-espera` with the room link shown **on-screen** (the primary, always-works channel) and waits for a
-doctor. (The route also contains a **parked** Twilio WhatsApp/SMS send — disabled pending Twilio
-compliance; see [.knowledge/TODOs.md](.knowledge/TODOs.md). No links are sent via WhatsApp today.)
+**Attention is always by video (2026-09-17).** A patient submits a request →
+[registro-paciente.tsx](pages/registro-paciente.tsx) creates the consultation in the API (no room yet)
+and lands on `/sala-espera`, which shows the case **waiting in its specialty's queue** — no button to
+enter, a high-demand notice and "watch your email". When a doctor takes the case, the API's claim
+creates the Jitsi room ([lib/jitsi.ts](lib/jitsi.ts) only rewrites the host) in the same atomic UPDATE,
+emails the patient, and the waiting room (SSE) shows "Entrar a la videoconsulta" without reloading.
+The WhatsApp claim path is gone (`via_whatsapp: true` → 422).
 
-Doctors use **"Atender al siguiente paciente"** in [panel-medico.tsx](pages/panel-medico.tsx),
-which assigns the next eligible `waiting` case (preferring present patients; falling back to waiting cases if
-heartbeat failed), opens the same Jitsi room, and navigates to
-`/panel-medico/consulta/[id]` for details/actions. Reserved needs (psychology: _Apoyo emocional_ / _Crisis de
-ansiedad_) only go to Psicología/Psiquiatría and never fall back to general doctors (`canAttend` in
-[lib/utils.ts](lib/utils.ts)). The API route is idempotent (one room per consultation).
+The queue is per specialty (API `services/queue_access.py`): **every specialty the doctor
+practises** (`doctor_specialties`), plus each one's `specialty_queue_access` extras (Psiquiatría →
+Psicología, Medicina interna → Medicina general) and the triage queue (`is_general_triage`,
+Medicina general) for anyone who treats physical health;
+admins see everything unless their specialty is mental-health-only; "Otra"/no specialty sees nothing.
+Doctors take a case with **"Atender paciente"** on its card in
+[panel-medico.tsx](pages/panel-medico.tsx) and can **derive** it to another specialty from the
+queue (same case, keeps its place) or, once attended, from the detail page with reason + signature
+(a child consultation enters the target queue, no appointment date).
 
-Admins/super_admins can also use `/panel-medico`: they keep a link back to `/admin/dashboard`, see admin
-counters plus an admin-only **Casos activos del sistema** section for `in_progress`, `urgent_in_person`, and
-`referred_to_specialist` cases (patient, status, motive, presence, assignment), and open those cases in the
-same `/panel-medico/consulta/[id]` detail page. Closing/no-show actions return to
-`/panel-medico?actualizado=1`; the panel refreshes counters on that flag, focus, and polling.
+Every entry to a room goes through [AntesDeEntrarModal](components/AntesDeEntrarModal.tsx) first,
+the "Información importante" notice: wait 15–20 minutes, the patient gets the "tu médico te está
+esperando" email, and (doctor side) contact the patient by WhatsApp if they don't show. Patients see
+it from `/sala-espera` and `/mi-caso`, with the Jitsi tips below. Doctors see it from the panel,
+where the case is claimed only on confirm (closing the notice leaves it in the queue), and from
+the detail page's "Unirse a videoconsulta". The room is opened from the confirm click, which is
+the user gesture that keeps `window.open` from being blocked as a pop-up.
+
+Admins/super_admins can also use `/panel-medico`: they keep a link back to `/admin/dashboard` and, in
+the queue, they see every specialty (unless their own is mental-health-only). Closing/no-show/derive
+actions return to `/panel-medico?actualizado=1`; the panel refreshes counters on that flag and focus,
+and the queue itself updates via Supabase Realtime (`postgres_changes` on `consultations`) — no
+polling.
 
 ### Revoking a doctor (operational)
 
@@ -233,14 +445,20 @@ the same button.
 
 ## Security notes
 
-- **Instant doctor access is a known trade-off:** anyone who self-registers as a doctor immediately
-  reads all patient PII via the `is_staff` RLS read. Mitigation is admin revocation, not pre-approval.
-  To switch to an approval gate later, have signup/`set_my_role` set doctors `verified = false` and
-  gate `current_user_role()` on it.
+- **Instant doctor access is a known trade-off:** anyone who self-registers as a doctor gets an
+  account right away. Ya NO lee la PII de pacientes por la RLS (`is_staff` exige ficha habilitada y
+  `patients` no se lee por PostgREST, ver Database): lo que ve sale de la API, detrás del gate de
+  credencial del backend. Mitigation is still admin revocation, not pre-approval.
+  To switch to an approval gate later, have signup/`finalize_role` set doctors
+  `users.verified = false`: `current_user_role()` **already** filters on it, so the gate would work
+  without touching RLS. Today that filter is a no-op because the column is `true` for every row —
+  el gancho está cableado pero nunca se ha usado (ver "Las dos columnas `verified`").
+  Para revocar hace falta ver a quién: esa visibilidad es `doctor_verified` en `GET /profiles`.
 - No service-role key is used client-side. Role escalation is prevented: profile updates are
   admin-only via RLS, and `set_my_role` only finalizes the caller's own profile once (patient/doctor,
   never admin/specialist).
-- Doctors update only `last_seen_at` via the `mark_myself_online()` RPC.
+- Doctor online status is Supabase Realtime **Presence** (app-level, no DB writes): only active
+  doctors `track` themselves, and only staff subscribe to the channel (see `lib/presence.tsx`).
 - Avoid storing full consultation conversations — only minimal operational data is kept.
 - `/admin` is unlinked from the public UI and marked `noindex`; it is not a real access control —
   RLS + the admin-role check on the page are.

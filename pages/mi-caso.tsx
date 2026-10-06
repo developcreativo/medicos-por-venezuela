@@ -1,179 +1,196 @@
-import Head from 'next/head'
+import Seo from '../components/Seo'
 import Link from 'next/link'
 import { useRouter } from 'next/router'
 import { useEffect, useState } from 'react'
 import { supabase } from '../lib/supabase'
-import { signInWithGoogle } from '../lib/auth'
-import GoogleButton from '../components/GoogleButton'
+import { fetchMyConsultations, fetchMyProfile, MyConsultation } from '../lib/consultations'
+import { fetchMyPatients, markEnteredCall } from '../lib/patients'
+import { resolvePostLoginRoute } from '../lib/postLogin'
 import { STATUS_LABELS } from '../lib/utils'
+import { requestNotifyPermission, scheduleLocalReminders } from '../lib/nativeNotifications'
+import CalendarSync from '../components/CalendarSync'
+import AntesDeEntrarModal from '../components/AntesDeEntrarModal'
+import SalaEsperaEnVivo from '../components/SalaEsperaEnVivo'
+import { downloadIcs } from '../lib/calendar'
+import { browserRoomUrl } from '../lib/jitsi'
+import { trackPatientInRoom } from '../lib/patientPresence'
+import { useWaitingRoom, type WaitingRoomState } from '../lib/waitingRoom'
+import HiloMensajes from '../components/mensajes/HiloMensajes'
 
-type Consultation = {
-  id: string
-  code: string
-  status: string
-  category: string | null
-  chief_complaint: string | null
-  referred_specialty: string | null
-  created_at: string
-}
+// Casos en los que el paciente sigue la sala en vivo: en cola, en atención o CITA AGENDADA (el
+// médico la inicia al entrar a la videollamada y la sala pasa a `ready` sin recargar). El botón de
+// entrar lo decide la sala (`phase === 'ready'`), no que la consulta tenga `video_room_url` — la
+// tenían desde el registro y el paciente entraba a una videollamada vacía.
+const CASO_ABIERTO = new Set(['waiting', 'in_progress', 'contacted_whatsapp', 'scheduled'])
 
 export default function MiCaso() {
   const router = useRouter()
   const [loading, setLoading] = useState(true)
   const [authed, setAuthed] = useState(false)
   const [patientName, setPatientName] = useState('')
-  const [consultations, setConsultations] = useState<Consultation[]>([])
-  // Login form state (shown when there is no session)
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [error, setError] = useState('')
+  const [consultations, setConsultations] = useState<MyConsultation[]>([])
+  const [conSesion, setConSesion] = useState(false)
+  const [token, setToken] = useState('')
+  // La sala que pidió abrir (mientras el modal de instrucciones está arriba).
+  const [salaPendiente, setSalaPendiente] = useState<WaitingRoomState | null>(null)
+  // La consulta cuya sala ya abrió. Mientras esta página siga abierta, se anuncia al médico que
+  // el paciente está en sala (mismo criterio que `/sala-espera`, que anuncia mientras ELLA está
+  // abierta y no mientras lo está la pestaña de Jitsi — que no hay forma de vigilar).
+  const [enSala, setEnSala] = useState('')
+  // El hilo de mensajes que el paciente tiene abierto (ver `hiloVisible` más abajo).
+  const [hiloAbierto, setHiloAbierto] = useState<string | null>(null)
 
   useEffect(() => {
     load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Presencia en vivo por Realtime (sin BD ni polling): es lo que pinta el badge "● En sala" en
+  // el panel del médico. Sin esto, un paciente que entra desde aquí en vez de desde la sala de
+  // espera le aparecería al médico como "○ Sin conexión" estando dentro de la sala.
+  useEffect(() => {
+    if (!enSala) return
+    return trackPatientInRoom(enSala)
+  }, [enSala])
+
+  // Abre la sala. Va DENTRO del clic de "Entendido" del modal para que `window.open` siga siendo
+  // parte de un gesto del usuario; fuera de él, el navegador lo bloquea como pop-up.
+  function abrirSala() {
+    const consulta = salaPendiente
+    setSalaPendiente(null)
+    if (!consulta?.video_room_url) return
+    setEnSala(consulta.consultation_id)
+    // La ventana se abre PRIMERO y sin esperar a nada: en cuanto haya un `await` de por medio,
+    // el navegador deja de considerar esto un gesto del usuario y bloquea el pop-up.
+    window.open(browserRoomUrl(consulta.video_room_url), '_blank', 'noopener,noreferrer')
+    // Y después se registra que entró. Es lo que el médico ve en su panel ("entró a la
+    // videollamada"): la presencia por Realtime se cae en cuanto esta pestaña pasa a segundo
+    // plano, que es exactamente lo que ocurre al abrir la sala desde un móvil. Fire-and-forget:
+    // que no se registre no puede impedir que el paciente entre a su consulta.
+    marcarEntrada(consulta.consultation_id)
+  }
+
+  async function marcarEntrada(consultationId: string) {
+    try {
+      const { data } = await supabase.auth.getSession()
+      // Sin token de sala: aquí el paciente llega con su sesión, y el backend la acepta como
+      // credencial para SU propia consulta (require_consultation_token).
+      await markEnteredCall(consultationId, undefined, data.session?.access_token)
+    } catch (e) {
+      console.error('No se pudo registrar la entrada a la videollamada:', e)
+    }
+  }
+
+  // Recordatorio nativo ~30 min antes de las citas agendadas del paciente (solo con la pestaña
+  // abierta; el email del backend es el canal confiable). Re-programa al cambiar sus consultas.
+  useEffect(() => {
+    requestNotifyPermission()
+    return scheduleLocalReminders(
+      consultations
+        .filter((c) => c.status === 'scheduled' && c.scheduled_at)
+        .map((c) => ({
+          when: new Date(c.scheduled_at as string),
+          title: 'Tu cita médica es pronto',
+          body: `${c.category || 'Consulta'} · ${new Date(c.scheduled_at as string).toLocaleString(
+            'es-VE'
+          )}`
+        }))
+    )
+  }, [consultations])
+
   async function load() {
     const {
       data: { session }
     } = await supabase.auth.getSession()
     if (!session) {
-      setAuthed(false)
-      setLoading(false)
+      router.replace('/login')
       return
     }
 
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('role, role_chosen')
-      .eq('id', session.user.id)
-      .single()
-    if (profile && !profile.role_chosen) {
-      router.replace('/elegir-rol')
-      return
-    }
-    if (profile && ['doctor', 'specialist'].includes(profile.role)) {
-      router.replace('/panel-medico')
-      return
-    }
-    if (profile && ['admin', 'super_admin'].includes(profile.role)) {
-      router.replace('/admin/dashboard')
-      return
-    }
-
-    setAuthed(true)
-    // Patient's own records (RLS: patients_select_own / consultations_select_own)
-    const { data: patients } = await supabase.from('patients').select('id, full_name')
-    const ids = (patients || []).map((p) => p.id)
-    if (patients && patients.length) setPatientName(patients[0].full_name)
-
-    if (ids.length) {
-      const { data: cons } = await supabase
-        .from('consultations')
-        .select('id, code, status, category, chief_complaint, referred_specialty, created_at')
-        .in('patient_id', ids)
-        .order('created_at', { ascending: false })
-      setConsultations((cons || []) as Consultation[])
-    }
-    setLoading(false)
-  }
-
-  async function login() {
-    setError('')
-    setLoading(true)
+    // Todo por el backend (no lecturas directas a Supabase): rol/estado por /auth/me, y los datos
+    // del paciente + sus consultas por sus endpoints (el backend los scopea a la propia cuenta).
+    const token = session.access_token
+    setConSesion(true)
+    setToken(token)
     try {
-      const { error: authError } = await supabase.auth.signInWithPassword({
-        email: email.trim().toLowerCase(),
-        password
-      })
-      if (authError) throw authError
-      await load()
+      const profile = await fetchMyProfile(token)
+      // Mismo resolvedor que /login y /auth/callback: si a este usuario le toca otro sitio, se va
+      // allí. Antes esta página tenía su propia copia con isAdminRole() (rol legacy, uno solo), que
+      // mandaba al panel a un médico que además es admin en user_roles.
+      const route = resolvePostLoginRoute(profile)
+      if (route.kind === 'blocked') {
+        await supabase.auth.signOut()
+        router.replace('/login')
+        return
+      }
+      if (route.href !== '/mi-caso') {
+        router.replace(route.href)
+        return
+      }
+      setAuthed(true)
+      const [patients, cons] = await Promise.all([
+        fetchMyPatients(token),
+        fetchMyConsultations(token)
+      ])
+      if (patients.length) setPatientName(patients[0].full_name)
+      setConsultations(cons)
     } catch (e) {
       console.error(e)
-      setError('Email o contraseña incorrectos.')
+      setAuthed(true) // sesión válida; si el backend falla, mostramos el portal sin datos
+    } finally {
       setLoading(false)
     }
   }
 
   async function logout() {
     await supabase.auth.signOut()
-    setAuthed(false)
-    setConsultations([])
+    router.replace('/login')
   }
+
+  // El `noindex` se declara ANTES del return temprano de carga, y no solo dentro del arbol final.
+  // En el servidor el estado inicial es siempre "cargando", asi que el HTML que recibe un crawler
+  // es SIEMPRE esa pantalla. Con el <Seo> unicamente en la rama de abajo, esa respuesta salia con
+  // el <head> vacio: sin `noindex`, sin `<title>` y con un 200. El `Disallow` de robots.txt pide
+  // que no se rastree, pero una URL enlazada desde fuera puede acabar indexada igualmente --el
+  // propio comentario de robots.txt explica por que hacen falta las dos senales-- y estas rutas
+  // no tienen gate en servidor: responden 200 y el control de acceso llega tras la hidratacion.
+  const seo = (
+    <Seo
+      titulo="Seguir mi caso — Médicos por Venezuela"
+      descripcion={'Consulta el estado de tu solicitud y el enlace de tu videoconsulta.'}
+      ruta="/mi-caso"
+      noindex
+    />
+  )
 
   if (loading)
     return (
-      <main className="page">
-        <div className="narrow">
-          <div className="card">Cargando...</div>
-        </div>
-      </main>
-    )
-
-  if (!authed) {
-    return (
       <>
-        <Head>
-          <title>Seguir mi caso — Médicos por Venezuela</title>
-        </Head>
+        {seo}
         <main className="page">
           <div className="narrow">
-            <Link href="/" className="link-button">
-              ← Volver
-            </Link>
-            <div className="card" style={{ marginTop: 14 }}>
-              <h1 style={{ marginTop: 0 }}>Seguir mi caso</h1>
-              <p style={{ color: '#64748b' }}>Inicia sesión para ver el estado de tu solicitud.</p>
-              <div className="grid">
-                <div>
-                  <label className="label">Email</label>
-                  <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
-                </div>
-                <div>
-                  <label className="label">Contraseña</label>
-                  <input
-                    type="password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') login()
-                    }}
-                  />
-                </div>
-                {error && <div className="notice notice-danger">{error}</div>}
-                <button className="btn btn-primary btn-full" onClick={login}>
-                  Entrar
-                </button>
-                <div style={{ textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>o</div>
-                <GoogleButton
-                  onClick={async () => {
-                    setError('')
-                    try {
-                      await signInWithGoogle()
-                    } catch {
-                      setError('No se pudo iniciar sesión con Google.')
-                    }
-                  }}
-                />
-                <p style={{ textAlign: 'center', color: '#64748b', fontSize: 13, margin: 0 }}>
-                  ¿No tienes cuenta?{' '}
-                  <Link href="/registro-paciente" style={{ color: '#0f6e56', fontWeight: 700 }}>
-                    Solicitar consulta
-                  </Link>
-                </p>
-              </div>
-            </div>
+            <div className="card">Cargando...</div>
           </div>
         </main>
       </>
     )
-  }
+
+  // Sin sesión, load() ya disparó el redirect a /login (la puerta única del sitio).
+  // Esta página es solo el portal del paciente; ya no aloja un formulario propio.
+  // Devuelve el <Seo> y no `null`: no pinta nada visible, pero deja el `noindex` en el <head>
+  // durante el instante en que el redirect está en vuelo.
+  if (!authed) return seo
+
+  // Qué hilo de mensajes está montado. `null` = el paciente no ha tocado nada todavía, así que se
+  // abre el de su consulta vigente (la primera abierta, o la primera de la lista); `''` = lo cerró
+  // a mano. Es un valor derivado a propósito: nada de `setState` en un effect.
+  const consultaVigente =
+    consultations.find((c) => CASO_ABIERTO.has(c.status))?.id || consultations[0]?.id || ''
+  const hiloVisible = hiloAbierto === null ? consultaVigente : hiloAbierto
 
   return (
     <>
-      <Head>
-        <title>Seguir mi caso — Médicos por Venezuela</title>
-      </Head>
+      {seo}
       <main className="page">
         <div className="narrow">
           <div className="topbar">
@@ -185,6 +202,12 @@ export default function MiCaso() {
               Salir
             </button>
           </div>
+
+          {consultations.some((c) => c.status === 'scheduled') && (
+            <div className="card" style={{ marginBottom: 14 }}>
+              <CalendarSync hint="Agrega tus citas a Google Calendar, iPhone/Apple u otra app y se sincronizan solas. No compartas la URL: da acceso a tus citas." />
+            </div>
+          )}
 
           {consultations.length === 0 ? (
             <div className="card">
@@ -208,17 +231,96 @@ export default function MiCaso() {
                     }}
                   >
                     <div>
-                      <strong>{c.category || 'Consulta'}</strong>
+                      <strong>{c.specialty || c.category || 'Consulta'}</strong>
                       <div style={{ color: '#64748b', fontSize: 13 }}>Código {c.code}</div>
                     </div>
                     <span className="badge badge-green">{STATUS_LABELS[c.status] || c.status}</span>
                   </div>
-                  {c.chief_complaint && <p style={{ color: '#475569' }}>{c.chief_complaint}</p>}
-                  {c.referred_specialty && (
-                    <p>
-                      <span className="badge badge-blue">Derivado a {c.referred_specialty}</span>
+                  {c.status === 'scheduled' && c.scheduled_at && (
+                    <p style={{ margin: '6px 0', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                      <span className="badge badge-blue">
+                        🗓 Cita agendada: {new Date(c.scheduled_at).toLocaleString('es-VE')}
+                      </span>
+                      <button
+                        className="btn btn-outline"
+                        style={{ padding: '2px 10px', fontSize: 13 }}
+                        onClick={() =>
+                          downloadIcs({
+                            uid: `${c.id}@medicosporvenezuela.org`,
+                            start: new Date(c.scheduled_at as string),
+                            title: `Cita médica${c.category ? ` · ${c.category}` : ''}`,
+                            description: `Motivo: ${c.chief_complaint || 'N/D'}\nCódigo: ${c.code}`
+                          })
+                        }
+                      >
+                        Agregar a calendario
+                      </button>
                     </p>
                   )}
+                  {c.chief_complaint && <p style={{ color: '#475569' }}>{c.chief_complaint}</p>}
+                  {c.derived_from_specialty && (
+                    <p>
+                      <span className="badge badge-blue">
+                        Derivado desde {c.derived_from_specialty}
+                      </span>
+                    </p>
+                  )}
+                  {c.status === 'referred_to_specialist' && (
+                    <p style={{ color: '#64748b', fontSize: 13 }}>
+                      Tu médico te derivó a un especialista. Sigue el estado en tu solicitud nueva,
+                      no hace falta que vuelvas a registrarte.
+                    </p>
+                  )}
+                  {/* La sala EN VIVO: dice si ya hay médico y solo entonces ofrece entrar. Es el
+                      enlace permanente a la sala: el de `/sala-espera` vive en aquella pestaña.
+                      En una cita agendada no repite el aviso (la tarjeta ya trae la fecha y el
+                      botón de calendario); sí mantiene el stream, que es lo que hace aparecer el
+                      botón apenas el médico inicia la cita. */}
+                  {CASO_ABIERTO.has(c.status) && conSesion && (
+                    <SalaDeLaConsulta
+                      consultationId={c.id}
+                      onEnter={setSalaPendiente}
+                      ocultarAgendada={c.status === 'scheduled'}
+                    />
+                  )}
+
+                  {/* Hilo de mensajes con el médico (U3 - Paciente con cuenta).
+                      Se monta SOLO el hilo abierto: cada `HiloMensajes` sondea la API cada 8 s,
+                      así que montarlos todos a la vez ponía N bucles en marcha en una pantalla
+                      donde el paciente lee uno. El de la consulta vigente viene abierto. */}
+                  <div style={{ marginTop: 16 }}>
+                    {hiloVisible === c.id ? (
+                      <>
+                        <button
+                          type="button"
+                          className="btn btn-muted"
+                          style={{ marginBottom: 10, padding: '8px 14px', fontSize: 14 }}
+                          onClick={() => setHiloAbierto('')}
+                          aria-expanded={true}
+                          aria-controls={`hilo-${c.id}`}
+                        >
+                          Ocultar mensajes
+                        </button>
+                        <div id={`hilo-${c.id}`}>
+                          <HiloMensajes
+                            consultationId={c.id}
+                            currentUserRole="patient"
+                            auth={{ token }}
+                            isCaseClosed={!CASO_ABIERTO.has(c.status)}
+                          />
+                        </div>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn btn-outline btn-full"
+                        onClick={() => setHiloAbierto(c.id)}
+                        aria-expanded={false}
+                      >
+                        Ver mensajes con mi médico
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
@@ -229,6 +331,37 @@ export default function MiCaso() {
           </div>
         </div>
       </main>
+
+      <AntesDeEntrarModal
+        open={salaPendiente !== null}
+        onCancel={() => setSalaPendiente(null)}
+        onConfirm={abrirSala}
+      />
     </>
+  )
+}
+
+// Una suscripción por caso abierto (normalmente uno). Componente aparte porque el hook va por caso.
+const CON_SESION = { useSession: true }
+
+function SalaDeLaConsulta({
+  consultationId,
+  onEnter,
+  ocultarAgendada
+}: {
+  consultationId: string
+  onEnter: (state: WaitingRoomState) => void
+  ocultarAgendada?: boolean
+}) {
+  const { state, error } = useWaitingRoom(consultationId, CON_SESION)
+  return (
+    <div style={{ marginTop: 8 }}>
+      <SalaEsperaEnVivo
+        state={state}
+        error={error}
+        onEnter={() => state && onEnter(state)}
+        ocultarAgendada={ocultarAgendada}
+      />
+    </div>
   )
 }

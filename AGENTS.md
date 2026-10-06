@@ -15,7 +15,9 @@ setup, and persistence conventions.
 Read [CLAUDE.md](CLAUDE.md) first. It documents:
 
 - Auth model (anonymous patients, instant-access doctors, admin revoke, Google OAuth role picker)
-- Architecture (Next.js frontend + Supabase BaaS, no separate backend server)
+- Architecture (Next.js frontend + Supabase BaaS for auth/queue/admin; doctor/patient/consultation
+  registration and the doctor self-profile `/panel-medico/perfil` now call a separate FastAPI
+  backend — see CLAUDE.md's Architecture section)
 - Routes, database schema, RLS policies, RPCs
 - Security trade-offs and mitigations
 
@@ -27,39 +29,51 @@ doesn't cover.
 Verified directly against `package.json` and the repo tree (not assumed):
 
 - **Next.js 14.2** (Pages Router) + **React 18** + **TypeScript 5**
-- **Supabase** (`@supabase/supabase-js` v2) — Postgres, Auth, RLS; no separate backend server
+- **Supabase** (`@supabase/supabase-js` v2) — Postgres, Auth, RLS for everything except doctor/patient/
+  consultation registration and the doctor self-profile, which now call a separate FastAPI backend
+- **Separate FastAPI backend** (`api-medicos-por-venezuela`, own repo) at `/api/v1/*`, called via
+  `lib/apiClient.ts` (`NEXT_PUBLIC_API_URL`, Supabase JWT as Bearer). Owns doctor/patient/consultation
+  registration (`lib/doctors.ts`/`lib/patients.ts`) and the doctor self-profile `/panel-medico/perfil`
+  — the migration is ongoing
 - One Vercel serverless API route: `pages/api/videoconsulta.ts` (Twilio v6 + Supabase service-role,
   server-only)
+- **Google Analytics 4** — no npm dependency: an inline snippet in `pages/_document.tsx`, gated on
+  the production hostname (`lib/analytics.ts`). Nothing loads in local or in branch previews
 - No CSS framework — plain global CSS classes
-- No state-management library, no ORM — raw Supabase JS client + RLS
+- No state-management library, no ORM — raw Supabase JS client + RLS, plus `fetch` via `lib/apiClient.ts`
 - `tsconfig.json` present; strictness not yet audited in depth
 
 ## Testing capabilities (strict_tdd: false)
 
-**There is still no automated test harness (unit/integration/E2E) in this repo.** Lint and format
-ARE now enforced (ESLint + Prettier) — only `test` tooling is missing:
+**E2E exists; unit/integration still don't.** Lint and format are enforced (ESLint + Prettier):
 
-- `package.json` scripts: `dev`, `build`, `start`, `lint`, `format`, `format:check` — no `test` script
-- Zero matches for `**/*.test.*` or `**/*.spec.*`
+- `package.json` scripts: `dev`, `build`, `start`, `lint`, `format`, `format:check`, `test:e2e`
+- E2E: Playwright (`playwright.config.ts`, specs in `e2e/`) against the local stack —
+  needs Docker + local Supabase + the FastAPI backend; `e2e/global-setup.ts` seeds the test accounts
+- No unit/integration specs (`**/*.test.*`) yet
 - CI runs lint + build on PRs (`.github/workflows/ci.yml`) but has no test step
 
 | Layer        | Available | Tool / Command                                 |
 | ------------ | --------- | ---------------------------------------------- |
 | Unit         | ❌        | —                                              |
 | Integration  | ❌        | —                                              |
-| E2E          | ❌        | —                                              |
+| E2E          | ✅        | `pnpm test:e2e` (Playwright, `e2e/`)           |
 | Linter       | ✅        | `pnpm lint` (ESLint, `eslint-config-next`)     |
 | Type checker | ✅ manual | `pnpm exec tsc --noEmit` (no dedicated script) |
 | Formatter    | ✅        | `pnpm format` / `pnpm format:check` (Prettier) |
 | Coverage     | ❌        | —                                              |
 
 **Implication for agents:** verification after a change means `pnpm build`, `pnpm exec tsc --noEmit`,
-`pnpm lint`, and manual QA in the browser — there is no automated test suite to run or extend. Most
-business logic lives in Postgres RLS/triggers (`supabase_schema.sql`), not application code, so
-verification often means reading SQL alongside TypeScript.
+`pnpm lint`, `pnpm test:e2e`, and manual QA in the browser. Most business logic lives in Postgres
+RLS/triggers (`supabase_schema.sql`), not application code, so verification often means reading SQL
+alongside TypeScript.
 
-**Recommendation (not yet actioned):** add Vitest + React Testing Library and a `test` script before
-enabling Strict TDD mode for this project.
+**No lances `pnpm build` con un `next dev` corriendo sobre el mismo directorio**: se pisan el `.next`
+y el dev server pasa a servir chunks rotos (React deja de hidratar). Los E2E lo evitan con
+`NEXT_DIST_DIR=.next-e2e`; para un build manual, usa esa misma variable o para el dev primero.
+
+**Recommendation (not yet actioned):** add Vitest + React Testing Library and a unit `test` script
+before enabling Strict TDD mode for this project.
 
 ## Contribution standards
 
@@ -68,6 +82,24 @@ hook); a `pre-commit` hook runs `lint-staged` (ESLint --fix + Prettier) on stage
 install automatically on `pnpm install` via the `prepare` script. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, and
 [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md) for the PR format.
+
+### Change log protocol
+
+**Every time a task is finished, update [changeslog.md](changeslog.md)** as
+the final step. Add a short entry at the top (newest first) — one or two lines on what changed and
+why, plus the key files/areas touched — grouping same-day work under a single `## YYYY-MM-DD`
+heading. This is the running history of the project; keep entries concise and factual.
+
+## Skills locales y módulo de mensajería (2026-09-29)
+
+Skills de trabajo en `.claude/skills/`: `nueva-funcionalidad` (spec → plan → todo → código →
+verificación → changeslog), `corregir-bug` (reproducir → E2E que falla → fix mínimo) y
+`mensajeria` (contexto del buzón médico ↔ paciente). El encargo de mensajería vive en
+`tasks/mensajeria-medico-paciente/` (UI) y, como spec canónica, en
+`../api-medicos-por-venezuela/tasks/mensajeria-medico-paciente/`; el contexto del cliente en
+`.knowledge/mensajeria.md`. Correcciones detectadas y aún no autorizadas:
+`tasks/backlog-correcciones.md` (incluye el drift de esta documentación: el stack real es
+Next 16 / React 19 / TypeScript 6 sobre AWS Amplify, y todo dato va por la API).
 
 ## SDD (Spec-Driven Development) setup
 
@@ -100,6 +132,9 @@ To recover any artifact: `mem_search(query: "{topic_key}", project: "medicos-por
 
 - This is a thin frontend over Supabase — most "backend" behavior is in
   [supabase_schema.sql](supabase_schema.sql), not TypeScript. Check both when investigating behavior.
+  The exception is the doctor self-profile, which calls the separate FastAPI backend via
+  `lib/apiClient.ts`/`lib/doctors.ts` — that logic lives in the `api-medicos-por-venezuela` repo,
+  not here.
 - Package manager is **pnpm** — never use `npm` or `yarn` commands in this repo.
 - `lint`, `format`, `format:check` scripts exist (ESLint + Prettier) but there is still no `test`
   script — don't assume one and don't invent one without discussing it with the user first.
@@ -112,3 +147,34 @@ To recover any artifact: `mem_search(query: "{topic_key}", project: "medicos-por
   pnpm exec tsc --noEmit
   pnpm lint
   ```
+
+## Las dos columnas `verified`
+
+Hay dos, se llaman igual y significan cosas distintas. Confundirlas ya causó un bug: la lista de
+médicos del admin mostraba a **todos** como "Verificado", incluidos los 795 (de 2955) cuya cédula
+no validó.
+
+| Columna            | Qué significa                                                                                                             | Quién la escribe                                           |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `users.verified`   | **Gancho reservado, hoy inerte.** Nace `true` en `handle_new_auth_user` y **ninguna ruta del backend la pone en `false`** | Solo `finalize_role`, y solo a `true`                      |
+| `doctors.verified` | El dato real: la cédula validó contra **SACS** (médico) o **FPV** (psicólogo)                                             | `_verify_credential()` al registrar y al cambiar la cédula |
+
+**Regla:** cualquier UI o lógica que hable de "verificado" en el sentido de credencial profesional
+lee `doctors.verified`. `users.verified` no debe decidir ni mostrarse; comprobarla es evaluar una
+constante.
+
+El admin lo ve vía `doctor_verified` en `GET /profiles` (LEFT JOIN a `doctors`, `null` = esa
+persona no tiene ficha). Fijado por `e2e/admin-cedula-verificada.spec.ts`.
+
+`users.verified` **no se borra**: `current_user_role()` sigue filtrando por ella, así que el gancho
+de aprobación previa (ver Security notes) funcionaría poniéndola en `false` sin tocar RLS.
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+# This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->

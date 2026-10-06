@@ -1,0 +1,292 @@
+// Setup global de Playwright: siembra tres médicos de prueba (cuenta de Auth + fila en
+// users/doctors con cédula y licencia, para que el panel cargue sin redirigir a completar perfil y
+// para que pasen el gate de credencial del backend) y guarda su sesión de Supabase como
+// storageState, de modo que los tests entren ya logueados sin pasar por el form de login.
+// Solo usa el Supabase LOCAL (127.0.0.1) — nunca prod.
+import { execSync } from 'node:child_process'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
+import { createClient } from '@supabase/supabase-js'
+import type { FullConfig } from '@playwright/test'
+import type { User } from '@supabase/supabase-js'
+
+const ROOT = path.join(__dirname, '..')
+const DB_CONTAINER = 'supabase_db_api-medicos-por-venezuela'
+
+function envVar(key: string): string {
+  // Sin BOM: editar `.env` con PowerShell (Set-Content -Encoding UTF8) lo agrega y la primera
+  // clave dejaría de matchear (el parseo a mano no lo ignora como sí hace Next).
+  const raw = readFileSync(path.join(ROOT, '.env'), 'utf8').replace(/^\uFEFF/, '')
+  const line = raw.split(/\r?\n/).find((l) => l.startsWith(`${key}=`))
+  if (!line) throw new Error(`Falta ${key} en .env`)
+  return line.slice(key.length + 1).trim()
+}
+
+const SUPABASE_URL = envVar('NEXT_PUBLIC_SUPABASE_URL')
+const ANON_KEY = envVar('NEXT_PUBLIC_SUPABASE_ANON_KEY')
+const SERVICE_KEY = envVar('SUPABASE_SERVICE_ROLE_KEY')
+
+// El backend gatea a los médicos por credencial: sin `license` (además de cédula y `verified`)
+// ninguno puede atender. Por eso doc1 y doc2 van completos — son los que trabajan en los specs de
+// panel/cola — y el caso "sin verificar" se aísla en doc3, que nadie más usa.
+const DOCTORS = [
+  {
+    email: 'e2e-doc1@example.com',
+    name: 'E2E Doctor Uno',
+    cedula: 'V-88880001',
+    license: 'MPPS-88880001',
+    file: 'e2e/.auth/doc1.json'
+  },
+  {
+    email: 'e2e-doc2@example.com',
+    name: 'E2E Doctor Dos',
+    cedula: 'V-88880002',
+    license: 'MPPS-88880002',
+    file: 'e2e/.auth/doc2.json'
+  },
+  {
+    email: 'e2e-doc3@example.com',
+    name: 'E2E Doctor Tres',
+    cedula: 'V-88880003',
+    license: 'MPPS-88880003',
+    file: 'e2e/.auth/doc3.json',
+    // Cédula NO validada por el SACS: es el médico bloqueado por el gate de credencial. Da los dos
+    // estados del badge del admin, el caso aprobable del panel y la pantalla de "pendiente".
+    // Tiene cédula y licencia a propósito: así aprobarlo SÍ lo habilita (`no_verificado`).
+    verified: false
+  }
+]
+const PASSWORD = 'e2e-Test-123456'
+
+async function ensureAuthUser(email: string): Promise<string> {
+  const admin = createClient(SUPABASE_URL, SERVICE_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false }
+  })
+  const created = await admin.auth.admin.createUser({
+    email,
+    password: PASSWORD,
+    email_confirm: true
+  })
+  if (created.data?.user) return created.data.user.id
+  // Ya existía: lo buscamos y le fijamos la contraseña conocida. `perPage` explícito: por defecto
+  // `listUsers()` trae solo los primeros 50, y con la suite del backend creando usuarios en el
+  // Supabase local, las cuentas de prueba quedaban fuera de esa primera página y el setup fallaba
+  // con "No pude crear ni encontrar".
+  const list = await admin.auth.admin.listUsers({ page: 1, perPage: 1000 })
+  if (list.error) {
+    throw new Error(`No pude listar los usuarios de auth: ${list.error.message}`)
+  }
+  // La anotación `: User[]` no es decorativa. `listUsers()` devuelve una unión discriminada por
+  // `error` (éxito -> `users: User[]`; fallo -> `users: []`), pero este `tsconfig.json` usa
+  // `strict: false`, así que sin `strictNullChecks` el `null` del caso correcto no discrimina
+  // nada: comprobar `list.error` arriba NO estrecha el tipo. `users` se quedaba como
+  // `User[] | []`, cuyo elemento común es `never`, y el `.find()` fallaba con
+  // `TS2339: Property 'email' does not exist on type 'never'`.
+  // Importa porque `next build` verifica tipos de TODO el proyecto (`ignoreBuildErrors: false`):
+  // este fichero de test rompía el build de producción y con él el despliegue en Amplify.
+  const usuarios: User[] = list.data.users
+  const user = usuarios.find((u) => u.email === email)
+  if (!user) throw new Error(`No pude crear ni encontrar ${email}: ${created.error?.message}`)
+  await admin.auth.admin.updateUserById(user.id, { password: PASSWORD })
+  return user.id
+}
+
+// `verified` = doctors.verified, el resultado de contrastar la cédula con SACS/FPV. Se fija a
+// propósito (doc3 va sin validar) para que admin-cedula-verificada.spec.ts tenga los dos estados.
+// No confundir con users.verified, que nace true y no gatea nada.
+function seedDoctorRow(
+  uid: string,
+  name: string,
+  cedula: string,
+  license: string,
+  verified = true
+): void {
+  const sql = [
+    // Idempotencia entre corridas: libera esta cédula de cualquier otro doctor de prueba previo.
+    `update public.doctors set cedula=null where cedula='${cedula}' and user_id<>'${uid}';`,
+    `update public.users set role='doctor', verified=true, active=true, role_chosen=true, full_name='${name}' where id='${uid}';`,
+    `insert into public.doctors (user_id, full_name, cedula) select '${uid}','${name}','${cedula}' where not exists (select 1 from public.doctors where user_id='${uid}');`,
+    // `status=1` y `license` se reafirman en cada corrida: son parte del gate de credencial, y un
+    // spec anterior (aprobar/revocar) pudo dejar `verified` en otro valor.
+    `update public.doctors set cedula='${cedula}', license='${license}', status=1, verified=${verified} where user_id='${uid}';`
+  ].join(' ')
+  execSync(`docker exec -i ${DB_CONTAINER} psql -U postgres -d postgres -c "${sql}"`, {
+    stdio: 'pipe'
+  })
+}
+
+async function saveSession(email: string, baseURL: string, file: string): Promise<void> {
+  const anon = createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } })
+  const { data, error } = await anon.auth.signInWithPassword({ email, password: PASSWORD })
+  if (error || !data.session) throw new Error(`Login falló para ${email}: ${error?.message}`)
+  const ref = new URL(SUPABASE_URL).hostname.split('.')[0] // '127' para 127.0.0.1
+  const storageState = {
+    cookies: [],
+    origins: [
+      {
+        origin: baseURL,
+        localStorage: [{ name: `sb-${ref}-auth-token`, value: JSON.stringify(data.session) }]
+      }
+    ]
+  }
+  writeFileSync(path.join(ROOT, file), JSON.stringify(storageState))
+}
+
+// Especialidad de los E2E de interconsulta. Se fija por NOMBRE para que el spec pueda elegir la
+// misma en el selector: el id es un UUID distinto en cada entorno.
+export const ESPECIALIDAD_E2E = 'Cardiología'
+// La cola es por especialidad: un médico sin especialidad no ve ningún caso. doc1 es el médico
+// general de los specs de cola, y las consultas de prueba se crean en esta misma especialidad
+// (`idEspecialidadGeneral` en helpers.ts).
+export const ESPECIALIDAD_GENERAL_E2E = 'Medicina general'
+
+// Fija la especialidad de una cuenta (users) y de su ficha (doctors), como lo haría el backend.
+function setSpecialty(uid: string, specialty: string): void {
+  setSpecialties(uid, [specialty])
+}
+
+// El conjunto de especialidades que ejerce (puede tener varias): la primera es la principal.
+function setSpecialties(uid: string, especialidades: string[]): void {
+  const [principal] = especialidades
+  const sql = [
+    `update public.users set specialty_id = (select id from public.specialties where name = '${principal}' and deleted_at is null limit 1), specialty = '${principal}' where id='${uid}';`,
+    `update public.doctors set specialty_id = (select id from public.specialties where name = '${principal}' and deleted_at is null limit 1), requested_specialty = null, requested_specialty_at = null where user_id='${uid}';`,
+    // El conjunto que decide su cola: se reafirma para que una corrida anterior (que puede haber
+    // marcado otras especialidades) no cambie lo que ven los demás specs.
+    `delete from public.doctor_specialties where user_id='${uid}';`,
+    ...especialidades.map(
+      (nombre) =>
+        `insert into public.doctor_specialties (user_id, specialty_id) select '${uid}', id from public.specialties where name = '${nombre}' and deleted_at is null limit 1;`
+    )
+  ].join(' ')
+  execSync(`docker exec -i ${DB_CONTAINER} psql -U postgres -d postgres -c "${sql}"`, {
+    stdio: 'pipe'
+  })
+}
+
+function cleanupTestData(): void {
+  // Borra consultas/pacientes de corridas E2E previas para que cada corrida arranque limpia
+  // (si no, se acumulan cards iguales y el localizador strict de Playwright falla).
+  const sql = [
+    // Las solicitudes de interconsulta primero: referencian a los pacientes de prueba.
+    `delete from public.interconsultation_requests where patient_id in (select id from public.patients where full_name like 'E2E Paciente%');`,
+    `delete from public.consultations where patient_id in (select id from public.patients where full_name like 'E2E Paciente%');`,
+    `delete from public.patients where full_name like 'E2E Paciente%';`
+  ].join(' ')
+  execSync(`docker exec -i ${DB_CONTAINER} psql -U postgres -d postgres -c "${sql}"`, {
+    stdio: 'pipe'
+  })
+
+  // Respuestas de encuestas de corridas previas (encuestas-marketing.spec.ts). Va aparte y sin
+  // hacer caer el setup: en una base sin la migración de la tabla, el borrado fallaría y se
+  // llevaría por delante la suite entera, cuando solo ese spec la necesita.
+  try {
+    execSync(
+      `docker exec -i ${DB_CONTAINER} psql -U postgres -d postgres -c ` +
+        `"delete from public.marketing_survey_responses where email like 'e2e-encuesta%';"`,
+      { stdio: 'pipe' }
+    )
+  } catch {
+    console.warn('[e2e] Sin la tabla marketing_survey_responses: ¿faltan migraciones del backend?')
+  }
+}
+
+export default async function globalSetup(config: FullConfig): Promise<void> {
+  const baseURL = (config.projects[0]?.use?.baseURL as string) || 'http://localhost:3100'
+  mkdirSync(path.join(ROOT, 'e2e', '.auth'), { recursive: true })
+  cleanupTestData()
+  for (const doc of DOCTORS) {
+    const uid = await ensureAuthUser(doc.email)
+    seedDoctorRow(uid, doc.name, doc.cedula, doc.license, doc.verified ?? true)
+    await saveSession(doc.email, baseURL, doc.file)
+  }
+  setSpecialty(await ensureAuthUser('e2e-doc1@example.com'), ESPECIALIDAD_GENERAL_E2E)
+
+  // Médico habilitado con especialidad "Otra" (especialidad-otra.spec.ts): no ve la cola hasta
+  // elegir la suya. Se reafirma "Otra" sin solicitud pendiente en cada corrida, porque el spec la
+  // cambia.
+  const otraUid = await ensureAuthUser('e2e-doc-otra@example.com')
+  seedDoctorRow(otraUid, 'E2E Doctor Otra', 'V-88880004', 'MPPS-88880004')
+  setSpecialty(otraUid, 'Otra')
+  // Las especialidades que ese spec agrega al catálogo, ya sin nadie que las tenga asignadas.
+  execSync(
+    `docker exec -i ${DB_CONTAINER} psql -U postgres -d postgres -c ` +
+      `"delete from public.specialties where name like 'Medicina del deporte E2E%';"`,
+    { stdio: 'pipe' }
+  )
+  await saveSession('e2e-doc-otra@example.com', baseURL, 'e2e/.auth/doc-otra.json')
+
+  // Admin de prueba (solo observa presencia, no es médico) para el test del dashboard.
+  const adminUid = await ensureAuthUser('e2e-admin@example.com')
+  execSync(
+    `docker exec -i ${DB_CONTAINER} psql -U postgres -d postgres -c ` +
+      `"update public.users set role='admin', verified=true, active=true, role_chosen=true, full_name='E2E Admin' where id='${adminUid}';"`,
+    { stdio: 'pipe' }
+  )
+  await saveSession('e2e-admin@example.com', baseURL, 'e2e/.auth/admin.json')
+
+  // Interconsulta asíncrona: doc2 es el ESPECIALISTA. Necesita `users.specialty_id` — sin él no
+  // le llega ninguna difusión ni ve nada en su bandeja (el backend filtra por especialidad).
+  // doc1 es Medicina general: es el médico tratante, y así se comprueba de paso que la bandeja de
+  // otra especialidad no muestra los casos de Cardiología.
+  const doc2Uid = await ensureAuthUser('e2e-doc2@example.com')
+  setSpecialty(doc2Uid, ESPECIALIDAD_E2E)
+
+  // DUAL multi-rol: rol legacy 'doctor' + super_admin ADICIONAL en user_roles (RBAC). Reproduce
+  // el caso real "primero doctor, luego se le agrega super_admin": el acceso admin debe salir
+  // del multi-rol del backend, no del único profiles.role.
+  const dualUid = await ensureAuthUser('e2e-dual@example.com')
+  const dualSql = [
+    `update public.users set role='doctor', verified=true, active=true, role_chosen=true, full_name='E2E Dual DoctorAdmin' where id='${dualUid}';`,
+    // idempotente: agrega super_admin activo solo si no lo tiene ya
+    `insert into public.user_roles (user_id, role_id) select '${dualUid}', r.id from public.roles r where r.code='super_admin' and not exists (select 1 from public.user_roles ur where ur.user_id='${dualUid}' and ur.role_id=r.id and ur.revoked_at is null);`
+  ].join(' ')
+  execSync(`docker exec -i ${DB_CONTAINER} psql -U postgres -d postgres -c "${dualSql}"`, {
+    stdio: 'pipe'
+  })
+  // Además de admin, EJERCE dos especialidades: es el caso real de una super_admin que también
+  // pasa consulta (ve todas las colas, pero quiere las suyas separadas). Con ficha habilitada,
+  // porque sin ella el panel la manda a completar el perfil profesional.
+  seedDoctorRow(dualUid, 'E2E Dual DoctorAdmin', 'V-88880005', 'MPPS-88880005')
+  setSpecialties(dualUid, [ESPECIALIDAD_GENERAL_E2E, ESPECIALIDAD_E2E])
+  await saveSession('e2e-dual@example.com', baseURL, 'e2e/.auth/dual.json')
+
+  // Paciente de prueba: el cuarto destino del fan-out de /login (login-fanout.spec.ts). No guarda
+  // storageState — ese spec entra por el formulario de verdad, no con la sesión ya puesta.
+  // Necesita su fila en `patients`: sin ficha de médico ni registro de paciente, el login rechaza
+  // la cuenta. El nombre NO empieza por 'E2E Paciente' para que cleanupTestData no la borre.
+  const patientUid = await ensureAuthUser('e2e-patient@example.com')
+  const patientSql = [
+    `update public.users set role='patient', active=true, role_chosen=true, full_name='E2E Paciente Login' where id='${patientUid}';`,
+    `insert into public.patients (full_name, phone_whatsapp, affected_zone, consent, consent_at, user_id) select 'E2E Titular Login', '+584120000000', 'Caracas', true, now(), '${patientUid}' where not exists (select 1 from public.patients where user_id='${patientUid}' and deleted_at is null);`
+  ].join(' ')
+  execSync(`docker exec -i ${DB_CONTAINER} psql -U postgres -d postgres -c "${patientSql}"`, {
+    stdio: 'pipe'
+  })
+
+  // Cuenta de Auth con rol médico y SIN ficha: lo que deja un registro de médico que creó la cuenta
+  // y no llegó a guardar la ficha (cuenta-sin-registro.spec.ts, registro-medico-correo.spec.ts).
+  // Se le borra cualquier ficha que haya dejado una corrida anterior: tiene que seguir sin tener
+  // NINGUNA, ni borrada, para que el registro la reconozca como "a medias".
+  const sinFichaUid = await ensureAuthUser('e2e-sin-ficha@example.com')
+  const sinFichaSql = [
+    `delete from public.doctors where user_id='${sinFichaUid}';`,
+    `delete from public.patients where user_id='${sinFichaUid}';`,
+    `update public.users set role='doctor', active=true, role_chosen=true, full_name='E2E Sin Ficha' where id='${sinFichaUid}';`
+  ].join(' ')
+  execSync(`docker exec -i ${DB_CONTAINER} psql -U postgres -d postgres -c "${sinFichaSql}"`, {
+    stdio: 'pipe'
+  })
+
+  // Cuenta a medio crear, como la que deja el primer inicio con Google: sin rol elegido, así que
+  // aterriza en /elegir-rol (terminos.spec.ts). `role_chosen=false` se reafirma en cada corrida por
+  // si alguna vez un spec la finaliza. No la bloquea el login aunque no tenga registro: elegir rol
+  // va antes de ese chequeo, para que el alta se termine en esa sesión.
+  const sinRolUid = await ensureAuthUser('e2e-sin-rol@example.com')
+  execSync(
+    `docker exec -i ${DB_CONTAINER} psql -U postgres -d postgres -c ` +
+      `"update public.users set role='patient', active=true, role_chosen=false, full_name='E2E Sin Rol' where id='${sinRolUid}';"`,
+    { stdio: 'pipe' }
+  )
+  await saveSession('e2e-sin-rol@example.com', baseURL, 'e2e/.auth/sin-rol.json')
+}

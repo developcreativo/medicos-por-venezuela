@@ -1,0 +1,520 @@
+// Cliente del backend (api-medicos-por-venezuela) para el panel médico: perfil propio, cola de
+// consultas y el claim atómico de una consulta. Reemplaza los accesos directos a Supabase/PostgREST
+// del panel — el único acceso directo que queda es Realtime (solo para avisar que algo cambió) y
+// Auth. Los datos siempre vienen por el backend.
+import { getJson, patchJson, postJson } from './apiClient'
+import { ClinicalAccess, Consultation, ATTENDING_STATUSES, Patient } from './admin'
+
+export { ApiError } from './apiClient'
+
+// GET /api/v1/auth/me — perfil del titular del JWT (reemplaza la lectura directa a `profiles`).
+// Trae también el contexto de médico (has_doctor_profile / doctor_cedula) para que el panel decida
+// el redirect a completar perfil SIN una segunda llamada a /doctors/me.
+export interface MyProfile {
+  id: string
+  full_name: string
+  role: string
+  role_chosen: boolean
+  specialty: string | null
+  verified: boolean
+  active: boolean
+  has_doctor_profile: boolean
+  doctor_cedula: string | null
+  // Hay ficha viva en `doctors` o paciente vivo en `patients` detrás de la cuenta. NO es
+  // `has_doctor_profile` (que es true para un médico de Google sin ficha). Con `false` el login no
+  // deja entrar salvo a un admin: ver lib/postLogin.ts. Opcional: una API anterior a este campo no
+  // lo manda, y ausente NO debe leerse como "sin registro".
+  has_account_record?: boolean
+}
+
+// Al cargar una página autenticada, /auth/me se pedía 3 VECES en paralelo: PresenceProvider lo
+// llama al montar Y otra vez cuando `onAuthStateChange` emite INITIAL_SESSION, y encima la página
+// (panel-medico, useAdminGuard, mi-caso…) lo pide por su cuenta. Como salen a la vez, ninguna
+// aprovecha la caché de preflight del navegador: son 3 OPTIONS + 3 GET, y cada GET cuesta 4
+// queries en el backend. Se coalescen aquí, en la función compartida, en vez de reordenar el
+// ciclo de vida de cada caller.
+//
+// La clave incluye el token: otra sesión (u otro usuario) nunca reusa este resultado. La ventana
+// es corta a propósito — coalescer la ráfaga del montaje, no cachear el perfil: un cambio de rol
+// se ve en la siguiente carga igual que antes.
+const PROFILE_COALESCE_MS = 5000
+let inflightProfile: { token: string; at: number; promise: Promise<MyProfile> } | null = null
+
+export async function fetchMyProfile(token: string): Promise<MyProfile> {
+  const now = Date.now()
+  if (inflightProfile && inflightProfile.token === token) {
+    if (now - inflightProfile.at < PROFILE_COALESCE_MS) return inflightProfile.promise
+  }
+  const promise = getJson<MyProfile>('/api/v1/auth/me', 'No se pudo cargar tu perfil', token)
+  const entry = { token, at: now, promise }
+  inflightProfile = entry
+  // Un fallo NO se cachea: si el siguiente caller reintenta, que salga de verdad a la red.
+  promise.catch(() => {
+    if (inflightProfile === entry) inflightProfile = null
+  })
+  return promise
+}
+
+// GET /api/v1/consultations (vista de paciente): el backend la scopea a las consultas del propio
+// paciente (Patient.user_id == caller) y devuelve la vista reducida (sin notas del staff). Para el
+// portal del paciente (mi-caso); reemplaza la lectura directa a `consultations`.
+export interface MyConsultation {
+  id: string
+  code: string
+  status: string
+  category: string | null
+  chief_complaint: string | null
+  referred_specialty: string | null
+  created_at: string
+  scheduled_at: string | null
+  // La sala de la videoconsulta. El backend ya la mandaba en esta vista (el paciente solo ve las
+  // suyas, scopeadas por `patients.user_id`); lo que faltaba era pedirla aquí. Es el único enlace
+  // permanente a la sala: el de `/sala-espera` vive en aquella pestaña y se pierde al cerrarla.
+  // OJO: que exista NO significa que haya médico; eso lo dice la sala en vivo (lib/waitingRoom.ts).
+  video_room_url: string | null
+  // Especialidad de la cola en la que está y, si lo derivaron, la de origen.
+  specialty?: string | null
+  derived_from_specialty?: string | null
+  parent_consultation_id?: string | null
+  clinical_access?: ClinicalAccess
+}
+export async function fetchMyConsultations(token: string): Promise<MyConsultation[]> {
+  return getJson<MyConsultation[]>(
+    '/api/v1/consultations',
+    'No se pudieron cargar tus consultas',
+    token
+  )
+}
+
+export interface PanelPatient {
+  id: string
+  // Opcional a propósito: en la cola de ESPERA (waiting) el backend NO envía el nombre por
+  // seguridad; solo llega en las consultas ya tomadas por el médico (mine).
+  full_name?: string
+  // Igual que el nombre: la cola de espera tampoco trae con qué identificar ni contactar al paciente.
+  cedula?: string | null
+  phone_whatsapp?: string | null
+  affected_zone: string | null
+  age_range: string | null
+  needs_tags: string[] | null
+  description: string | null
+  // Presente también en la cola de espera (sin nombre): el médico las necesita para decidir si
+  // toma el caso, no después de abrirlo.
+  allergies: string | null
+  clinical_access?: ClinicalAccess
+}
+
+export interface PanelConsultation {
+  id: string
+  code: string
+  status: string
+  priority: string
+  category: string | null
+  // Nombre de la especialidad solicitada (specialty_id resuelta por el backend): la columna
+  // con la que la consulta matchea con el médico. null en consultas viejas (fallback legacy).
+  specialty: string | null
+  chief_complaint: string | null
+  referred_specialty: string | null
+  video_room_url: string | null
+  assigned_doctor_id: string | null
+  attended_via_whatsapp: boolean
+  opened_at: string | null
+  closed_at: string | null
+  patient_last_seen_at: string | null
+  // Cuándo pulsó el paciente para entrar a la videollamada. Es la única señal DURADERA de que
+  // llegó: la presencia por Realtime se apaga en cuanto esta pestaña pasa a segundo plano, que
+  // es justo lo que ocurre al abrir la sala desde un móvil (ver EstadoPacienteBadge).
+  entered_call_at: string | null
+  created_at: string
+  // Hora de llegada del paciente a la cola: ordena la cola y dice cuánto lleva esperando. Un caso
+  // derivado conserva la original.
+  queued_at: string
+  specialty_id: string | null
+  // Especialidad desde la que se derivó a esta cola (null si no viene derivado).
+  derived_from_specialty: string | null
+  patient: PanelPatient | null
+  clinical_access?: ClinicalAccess
+}
+
+// Por qué el médico no ve ninguna cola: sin especialidad, o con "Otra".
+export type QueueBlockedReason = 'sin_especialidad' | 'especialidad_por_definir'
+
+export interface SpecialtyRef {
+  id: string
+  name: string
+}
+
+// Una cola del panel: la especialidad que la titula y los `specialty_id` de los casos que entran
+// en ella (los suyos más sus accesos extra, p. ej. Psicología dentro de Psiquiatría).
+export interface QueueGroup {
+  // null en la cola del resto (`is_rest`): no es una especialidad del catálogo.
+  id: string | null
+  name: string
+  // Cola de entrada (Medicina general): el panel la nombra distinto.
+  is_triage: boolean
+  // "Otras especialidades": lo que ve un admin que además ejerce y no entra en sus otras colas.
+  // Viene sin ids a propósito — se arma por descarte, para que una especialidad nueva no se caiga
+  // del panel.
+  is_rest?: boolean
+  specialty_ids: string[]
+}
+
+export interface PanelResponse {
+  waiting: PanelConsultation[]
+  mine: PanelConsultation[]
+  my_closed_count: number
+  // Opcional: una API anterior a la cola por especialidad no lo manda.
+  queue_blocked_reason?: QueueBlockedReason | null
+  // Las colas que el panel pinta por separado: una por especialidad del médico (puede tener
+  // varias) más la de entrada (Medicina general) si atiende salud física. Con una sola se muestra
+  // la lista directa; un admin (ve todas) no recibe ninguna.
+  queues?: QueueGroup[]
+}
+
+// GET /api/v1/consultations/panel — cola de espera + mis consultas abiertas + cerradas por mí.
+export async function fetchPanel(token: string): Promise<PanelResponse> {
+  return getJson<PanelResponse>(
+    '/api/v1/consultations/panel',
+    'No se pudieron cargar las consultas',
+    token
+  )
+}
+
+// POST /api/v1/consultations/{id}/claim — toma atómica. Lanza ApiError 409 si otro médico la
+// tomó primero (condición de carrera resuelta en la base, un único ganador) y 403 si el caso no es
+// de sus colas. La atención es siempre por video: el MISMO claim deja creada la sala, y la
+// respuesta trae su `video_room_url`.
+export async function claimConsultation(id: string, token: string): Promise<PanelConsultation> {
+  return postJson<PanelConsultation>(
+    `/api/v1/consultations/${id}/claim`,
+    {},
+    'No se pudo tomar la consulta',
+    token
+  )
+}
+
+// --- Derivar a otra especialidad (ver tasks/cola-por-especialidad/spec.md en la API) ---
+
+export interface DerivationTarget {
+  id: string
+  name: string
+}
+
+// GET /consultations/derivation-targets — especialidades con médicos atendiendo su cola.
+export async function fetchDerivationTargets(token: string): Promise<DerivationTarget[]> {
+  return getJson<DerivationTarget[]>(
+    '/api/v1/consultations/derivation-targets',
+    'No se pudieron cargar las especialidades',
+    token
+  )
+}
+
+// POST /consultations/{id}/derive — un caso de la cola (sin tomar) pasa a la cola de otra
+// especialidad. 409 si otro médico lo tomó o lo movió mientras tanto.
+export async function deriveConsultation(
+  id: string,
+  specialtyId: string,
+  token: string
+): Promise<AgendaConsultation> {
+  return postJson<AgendaConsultation>(
+    `/api/v1/consultations/${id}/derive`,
+    { specialty_id: specialtyId },
+    'No se pudo derivar el caso',
+    token
+  )
+}
+
+// POST /consultations/{id}/refer-to-queue — derivar con especialista desde un caso atendido: cierra
+// la parte del médico (firmada, con el motivo) y el paciente entra a la cola de la especialidad,
+// sin cita. Devuelve la consulta nueva.
+export async function referToQueue(
+  id: string,
+  body: { specialty_id: string; reason: string; signature?: string },
+  token: string
+): Promise<AgendaConsultation> {
+  return postJson<AgendaConsultation>(
+    `/api/v1/consultations/${id}/refer-to-queue`,
+    body,
+    'No se pudo derivar con el especialista',
+    token
+  )
+}
+
+// --- Monitor admin de consultas "en progreso" (ver components/admin/ConsultationsMonitorModal.tsx) ---
+
+// Subconjunto de ConsultationResponse (backend) que necesita el monitor: estado, nombres
+// resueltos server-side (patient_name / assigned_doctor_name), y los timestamps para calcular el
+// tiempo en progreso.
+export interface ConsultationMonitorItem {
+  id: string
+  code: string
+  status: string
+  chief_complaint: string | null
+  patient_name: string | null
+  assigned_doctor_name: string | null
+  queued_at: string
+  started_at: string | null
+  opened_at: string | null
+  clinical_access?: ClinicalAccess
+}
+
+// El endpoint solo acepta un `status` a la vez (ver src/routers/consultations.py::list_consultations
+// del backend — no hay filtro multi-status), así que se pide una página por cada status del set
+// "en progreso" del dashboard (mismo set que el panel médico en "mis consultas abiertas":
+// ATTENDING_STATUSES = in_progress + contacted_whatsapp) y se combinan los resultados.
+// 100 es el límite máximo permitido por el backend (`le=100`).
+const PAGE_LIMIT = 100
+
+export async function fetchInProgressConsultations(
+  token: string
+): Promise<ConsultationMonitorItem[]> {
+  // allSettled (no all): que un status puntual falle en el backend no debe tumbar todo
+  // el modal. Si TODAS fallan, propagamos el primer error para que el modal lo muestre;
+  // si al menos una responde, mostramos lo que se pudo cargar.
+  const results = await Promise.allSettled(
+    ATTENDING_STATUSES.map((status) =>
+      getJson<ConsultationMonitorItem[]>(
+        `/api/v1/consultations?status=${encodeURIComponent(status)}&limit=${PAGE_LIMIT}`,
+        'No se pudieron cargar las consultas en progreso',
+        token
+      )
+    )
+  )
+  const fulfilled = results.filter(
+    (r): r is PromiseFulfilledResult<ConsultationMonitorItem[]> => r.status === 'fulfilled'
+  )
+  if (fulfilled.length === 0) {
+    throw (results[0] as PromiseRejectedResult).reason
+  }
+  return fulfilled.flatMap((r) => r.value)
+}
+
+// --- Agenda / seguimiento (módulo Agenda; NO confundir con Interconsulta en vivo) ---
+
+// Cita agendada / consulta de la agenda (subset de ConsultationResponse del backend).
+export interface AgendaConsultation {
+  id: string
+  code: string
+  status: string
+  chief_complaint: string | null
+  patient_name: string | null
+  assigned_doctor_name: string | null
+  scheduled_at: string | null
+  parent_consultation_id: string | null
+  video_room_url: string | null
+  created_at: string
+  clinical_access?: ClinicalAccess
+}
+
+// Un eslabón de la cadena de seguimiento (historial padre→hijas).
+export interface ChainItem {
+  id: string
+  code: string
+  status: string
+  chief_complaint: string | null
+  internal_note: string | null
+  scheduled_at: string | null
+  closed_at: string | null
+  created_at: string
+  parent_consultation_id: string | null
+  clinical_access?: ClinicalAccess
+}
+
+// POST /consultations/{id}/close — cierra la consulta (firmada) por el BACKEND (reemplaza el UPDATE
+// directo a Supabase). outcome 'closed' | 'patient_no_show'.
+export async function closeConsultationApi(
+  id: string,
+  body: { outcome: 'closed' | 'patient_no_show'; note?: string; signature?: string },
+  token: string
+): Promise<AgendaConsultation> {
+  return postJson<AgendaConsultation>(
+    `/api/v1/consultations/${id}/close`,
+    body,
+    'No se pudo cerrar la consulta',
+    token
+  )
+}
+
+// POST /consultations/{id}/schedule-follow-up — cierra la consulta (firmada) y crea la hija agendada.
+export async function scheduleFollowUp(
+  id: string,
+  body: { scheduled_at: string; closing_note?: string; signature?: string },
+  token: string
+): Promise<AgendaConsultation> {
+  return postJson<AgendaConsultation>(
+    `/api/v1/consultations/${id}/schedule-follow-up`,
+    body,
+    'No se pudo agendar el seguimiento',
+    token
+  )
+}
+
+// GET /consultations/agenda — mi agenda (citas agendadas del médico autenticado).
+export async function fetchAgenda(token: string): Promise<AgendaConsultation[]> {
+  return getJson<AgendaConsultation[]>(
+    '/api/v1/consultations/agenda',
+    'No se pudo cargar la agenda',
+    token
+  )
+}
+
+// POST /consultations/{id}/start — abre una cita AGENDADA: la pasa a `in_progress` y le crea la
+// sala de video si falta. Es el equivalente al claim de la cola para la Agenda, y el backend
+// encola el correo "tu médico ya está en la sala" al paciente. 409 si ya no está agendada
+// (doble clic) o si es de otro médico.
+export async function startConsultation(id: string, token: string): Promise<AgendaConsultation> {
+  return postJson<AgendaConsultation>(
+    `/api/v1/consultations/${id}/start`,
+    {},
+    'No se pudo iniciar la cita agendada',
+    token
+  )
+}
+
+// GET /consultations/{id}/chain — historial de la cadena de seguimiento (padre→hijas).
+export async function fetchChain(id: string, token: string): Promise<ChainItem[]> {
+  return getJson<ChainItem[]>(
+    `/api/v1/consultations/${id}/chain`,
+    'No se pudo cargar el historial',
+    token
+  )
+}
+
+// --- Detalle de consulta (panel médico): reemplaza el acceso directo a Supabase ---
+export interface ConsultationDetailPatient {
+  id: string
+  full_name: string
+  cedula: string | null
+  phone_whatsapp: string | null
+  emergency_phone?: string | null
+  email: string | null
+  affected_zone: string | null
+  age_range: string | null
+  needs_tags: string[] | null
+  description: string | null
+  clinical_access?: ClinicalAccess
+}
+
+// GET /consultations/{id}: la consulta con el paciente anidado (solo staff que puede verla).
+export interface ConsultationDetail {
+  id: string
+  code: string
+  status: string
+  priority: string
+  category: string | null
+  chief_complaint: string | null
+  created_at: string
+  opened_at: string | null
+  closed_at: string | null
+  referred_specialty: string | null
+  internal_note: string | null
+  video_room_url: string | null
+  patient_last_seen_at: string | null
+  entered_call_at: string | null
+  assigned_doctor_id: string | null
+  attended_via_whatsapp: boolean
+  scheduled_at: string | null
+  specialty?: string | null
+  derived_from_specialty?: string | null
+  // Solo si el caso llegó derivado: quién lo derivó, desde qué especialidad y por qué.
+  derivation?: {
+    from_specialty: string | null
+    by_name: string | null
+    reason: string | null
+    at: string
+  } | null
+  patient: ConsultationDetailPatient | null
+  clinical_access?: ClinicalAccess
+}
+
+export async function fetchConsultationDetail(
+  id: string,
+  token: string
+): Promise<ConsultationDetail> {
+  return getJson<ConsultationDetail>(
+    `/api/v1/consultations/${id}`,
+    'No se pudo cargar la consulta',
+    token
+  )
+}
+
+// PATCH /consultations/{id}: estado y/o nota interna (reemplaza el UPDATE directo a Supabase).
+export async function updateConsultation(
+  id: string,
+  body: {
+    status?: string
+    // Solo el médico: es dato clínico y el backend responde 403 si la manda un admin.
+    internal_note?: string
+    // Campos que edita el panel admin/pacientes (además del panel médico).
+    assigned_doctor_id?: string | null
+    specialty_id?: string | null
+    admin_seguimiento?: string | null
+    nota_admin?: string | null
+    contacted?: boolean
+    closed_at?: string | null
+  },
+  token: string
+): Promise<ConsultationDetail> {
+  return patchJson<ConsultationDetail>(
+    `/api/v1/consultations/${id}`,
+    body,
+    'No se pudo actualizar la consulta',
+    token
+  )
+}
+
+// GET /api/v1/consultations — lista completa para staff, con el paciente anidado y los campos de
+// gestión admin (admin_seguimiento/nota_admin) + assigned_doctor_name resuelto server-side. El panel
+// admin/pacientes la consume en vez de leer `consultations`/`patients`/`users` directo de Supabase.
+export async function fetchConsultations(
+  token: string,
+  params: { limit?: number; skip?: number; status?: string; patientId?: string } = {}
+): Promise<Consultation[]> {
+  const qs = new URLSearchParams()
+  qs.set('limit', String(params.limit ?? 200))
+  if (params.skip) qs.set('skip', String(params.skip))
+  if (params.status) qs.set('status', params.status)
+  if (params.patientId) qs.set('patient_id', params.patientId)
+  const rows = await getJson<(Omit<Consultation, 'patients'> & { patient: Patient | null })[]>(
+    `/api/v1/consultations?${qs.toString()}`,
+    'No se pudieron cargar las consultas',
+    token
+  )
+  // El backend anida el paciente en `patient`; el panel usa `patients` (alias histórico del join).
+  return rows.map(({ patient, ...c }) => ({ ...c, patients: patient }))
+}
+
+// Evento del historial, con el AUTOR ya resuelto por el backend (sin leer `users` en el cliente).
+export interface ConsultationEventItem {
+  id: string
+  event_type: string
+  note: string | null
+  created_by: string | null
+  created_at: string
+  author_name: string | null
+  author_role: string | null
+}
+
+export async function fetchConsultationEvents(
+  id: string,
+  token: string
+): Promise<ConsultationEventItem[]> {
+  return getJson<ConsultationEventItem[]>(
+    `/api/v1/consultations/${id}/events`,
+    'No se pudo cargar el historial',
+    token
+  )
+}
+
+export async function addConsultationEvent(
+  id: string,
+  body: { event_type: string; note?: string },
+  token: string
+): Promise<ConsultationEventItem> {
+  return postJson<ConsultationEventItem>(
+    `/api/v1/consultations/${id}/events`,
+    { consultation_id: id, ...body },
+    'No se pudo registrar el evento',
+    token
+  )
+}

@@ -4,6 +4,13 @@
 
 create extension if not exists pgcrypto;
 
+-- NOTA (migración profiles → users, expand/contract): la tabla core de cuentas fue renombrada a
+-- `public.users` y `public.profiles` quedó como VISTA de compatibilidad sobre ella. El API y las
+-- funciones de abajo (handle_new_auth_user, set_my_role, current_user_role, mark_myself_online,
+-- admin_delete_patient) ya nombran `public.users`. El bloque de DDL/RLS que sigue aún se escribe
+-- sobre `profiles` (se sincronizará junto con la migración de rename, que vive en el repo del API);
+-- el `drop view public.profiles` se hará como paso final, solo tras desplegar el front migrado.
+
 -- 1) Staff profiles linked to Supabase Auth users
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
@@ -72,6 +79,8 @@ alter table public.patients add column if not exists description text;
 alter table public.patients add column if not exists consent boolean default false;
 alter table public.patients add column if not exists consent_at timestamptz;
 alter table public.patients add column if not exists created_at timestamptz default now();
+-- Optional contact email — a fallback when the phone number doesn't work.
+alter table public.patients add column if not exists email text;
 
 -- 4) Consultations/cases. WhatsApp messages are not stored here.
 create table if not exists public.consultations (
@@ -87,10 +96,11 @@ create table if not exists public.consultations (
   internal_note text,
   video_room_url text,
   patient_last_seen_at timestamptz, -- heartbeat: last time the patient's waiting-room page pinged
+  entered_call_at timestamptz, -- first time the patient clicked "Entrar a la videoconsulta"
   opened_at timestamptz,
   closed_at timestamptz,
   created_at timestamptz not null default now(),
-  constraint consultations_status_check check (status in ('waiting', 'in_progress', 'referred_to_specialist', 'urgent_in_person', 'closed', 'cancelled', 'patient_no_show'))
+  constraint consultations_status_check check (status in ('waiting', 'in_progress', 'referred_to_specialist', 'urgent_in_person', 'closed', 'cancelled', 'patient_no_show', 'closed_by_admin', 'contacted_whatsapp'))
 );
 
 alter table public.consultations add column if not exists category text;
@@ -100,14 +110,32 @@ alter table public.consultations add column if not exists referred_specialty tex
 alter table public.consultations add column if not exists internal_note text;
 alter table public.consultations add column if not exists video_room_url text;
 alter table public.consultations add column if not exists patient_last_seen_at timestamptz;
+alter table public.consultations add column if not exists entered_call_at timestamptz;
 alter table public.consultations add column if not exists opened_at timestamptz;
 alter table public.consultations add column if not exists closed_at timestamptz;
 alter table public.consultations add column if not exists created_at timestamptz default now();
+-- Admin follow-up flag: whether an admin has contacted the patient about this case (set from the
+-- admin dashboard, independent of status).
+alter table public.consultations add column if not exists contacted boolean not null default false;
+-- Admin case follow-up: which super_admin is following up (admin_seguimiento) and a free-text admin
+-- note (nota_admin). Both are edited from the admin dashboard cases table.
+alter table public.consultations add column if not exists admin_seguimiento uuid references public.profiles(id);
+alter table public.consultations add column if not exists nota_admin text;
+-- Doctor chose to attend this case directly via WhatsApp (their personal number) instead of video;
+-- the case-detail page then shows the WhatsApp status controls and hides the video/close buttons.
+alter table public.consultations add column if not exists attended_via_whatsapp boolean not null default false;
+-- Admin override of which specialties may attend the case. NULL/empty = derive from the tipo de
+-- ayuda (category/needs); when set, it takes precedence over that derivation.
+alter table public.consultations add column if not exists required_specialties text[];
+-- How the patient chose to be attended after registering (on /sala-espera): 'video' (wait in the
+-- Jitsi room for immediate help) or 'whatsapp' (be contacted by a doctor via WhatsApp). A 'whatsapp'
+-- case enters the doctors' contact pool immediately, bypassing the "waited >20 min" fallback.
+alter table public.consultations add column if not exists contact_preference text not null default 'video';
 
--- Allow the 'patient_no_show' status on existing databases (idempotent).
+-- Allow the 'patient_no_show' and 'closed_by_admin' statuses on existing databases (idempotent).
 alter table public.consultations drop constraint if exists consultations_status_check;
 alter table public.consultations add constraint consultations_status_check
-  check (status in ('waiting', 'in_progress', 'referred_to_specialist', 'urgent_in_person', 'closed', 'cancelled', 'patient_no_show'));
+  check (status in ('waiting', 'in_progress', 'referred_to_specialist', 'urgent_in_person', 'closed', 'cancelled', 'patient_no_show', 'closed_by_admin', 'contacted_whatsapp'));
 
 -- 5) Events/audit trail for status changes.
 create table if not exists public.consultation_events (
@@ -118,6 +146,21 @@ create table if not exists public.consultation_events (
   note text,
   created_at timestamptz not null default now()
 );
+
+-- Ensure cascading deletes on EXISTING databases. `create table if not exists` never alters a
+-- foreign key that was first created without ON DELETE CASCADE, so older databases keep the default
+-- NO ACTION and block deleting a patient (you'd get a foreign-key violation from `consultations`).
+-- Re-applying the constraints idempotently makes "delete a patient" also remove their consultations
+-- and the related audit events. (Constraint names are Postgres' defaults: <table>_<column>_fkey.)
+alter table public.consultations drop constraint if exists consultations_patient_id_fkey;
+alter table public.consultations
+  add constraint consultations_patient_id_fkey
+  foreign key (patient_id) references public.patients(id) on delete cascade;
+
+alter table public.consultation_events drop constraint if exists consultation_events_consultation_id_fkey;
+alter table public.consultation_events
+  add constraint consultation_events_consultation_id_fkey
+  foreign key (consultation_id) references public.consultations(id) on delete cascade;
 
 create index if not exists idx_profiles_role on public.profiles(role);
 create index if not exists idx_profiles_last_seen on public.profiles(last_seen_at);
@@ -148,7 +191,7 @@ begin
   has_role := coalesce(meta_role in ('patient', 'doctor'), false);
   resolved_role := case when has_role then meta_role else 'patient' end;
 
-  insert into public.profiles (
+  insert into public.users (
     id, email, full_name, role,
     specialty, country, medical_license, whatsapp_number,
     verified, active, role_chosen
@@ -194,7 +237,7 @@ begin
     raise exception 'invalid role';
   end if;
 
-  update public.profiles
+  update public.users
   set
     role = p_role,
     specialty = case when p_role = 'doctor' then p_specialty else specialty end,
@@ -223,7 +266,7 @@ stable
 security definer
 set search_path = public
 as $$
-  select role from public.profiles where id = auth.uid() and active = true and verified = true;
+  select role from public.users where id = auth.uid() and active = true and verified = true;
 $$;
 
 create or replace function public.is_admin()
@@ -254,7 +297,7 @@ security definer
 set search_path = public
 as $$
 begin
-  update public.profiles set last_seen_at = now() where id = auth.uid();
+  update public.users set last_seen_at = now() where id = auth.uid();
 end;
 $$;
 
@@ -278,6 +321,100 @@ end;
 $$;
 
 grant execute on function public.mark_patient_waiting(uuid) to anon, authenticated;
+
+-- Patient clicked "Entrar a la videoconsulta". Records the first click (entered_call_at is only set
+-- once, via coalesce) and refreshes the presence heartbeat. Used so admin metrics count a case as
+-- "esperando" only after the patient has actually entered the call — not the moment they submitted.
+-- Security definer so anonymous patients can set only this timestamp, and only on still-open cases.
+create or replace function public.mark_patient_entered_call(p_consultation_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_first_entry boolean;
+begin
+  select entered_call_at is null into v_first_entry
+  from public.consultations
+  where id = p_consultation_id
+    and status in ('waiting', 'in_progress');
+
+  update public.consultations
+  set entered_call_at = coalesce(entered_call_at, now()),
+      patient_last_seen_at = now()
+  where id = p_consultation_id
+    and status in ('waiting', 'in_progress');
+
+  -- Log once, on the patient's first entry into the video call (trazabilidad timeline).
+  if v_first_entry then
+    insert into public.consultation_events (consultation_id, event_type)
+    values (p_consultation_id, 'patient_entered_call');
+  end if;
+end;
+$$;
+
+grant execute on function public.mark_patient_entered_call(uuid) to anon, authenticated;
+
+-- Patient chose "Prefiero ser contactado/a por WhatsApp" on /sala-espera. Flags the case so it enters
+-- the doctors' WhatsApp contact pool right away (no 20-min wait). Security definer so anonymous
+-- patients can set only this preference, and only on still-open cases.
+create or replace function public.mark_patient_wants_whatsapp(p_consultation_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_first_choice boolean;
+begin
+  select contact_preference is distinct from 'whatsapp' into v_first_choice
+  from public.consultations
+  where id = p_consultation_id
+    and status in ('waiting', 'in_progress');
+
+  update public.consultations
+  set contact_preference = 'whatsapp',
+      patient_last_seen_at = now()
+  where id = p_consultation_id
+    and status in ('waiting', 'in_progress');
+
+  -- Log once, when the patient first chooses WhatsApp contact (trazabilidad timeline).
+  if v_first_choice then
+    insert into public.consultation_events (consultation_id, event_type)
+    values (p_consultation_id, 'patient_wants_whatsapp');
+  end if;
+end;
+$$;
+
+grant execute on function public.mark_patient_wants_whatsapp(uuid) to anon, authenticated;
+
+-- Hard-delete a patient and everything tied to them (consultations + their audit events). Reserved
+-- for super_admins (used by the admin dashboard to remove test/junk records). Security definer so it
+-- can delete across tables regardless of RLS; it deletes children explicitly, so it does not rely on
+-- the FK ON DELETE CASCADE being applied. Irreversible.
+create or replace function public.admin_delete_patient(p_patient_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not exists (
+    select 1 from public.users
+    where id = auth.uid() and role = 'super_admin' and active = true
+  ) then
+    raise exception 'Only an active super_admin may delete patients';
+  end if;
+
+  delete from public.consultation_events
+    where consultation_id in (select id from public.consultations where patient_id = p_patient_id);
+  delete from public.consultations where patient_id = p_patient_id;
+  delete from public.patients where id = p_patient_id;
+end;
+$$;
+
+grant execute on function public.admin_delete_patient(uuid) to authenticated;
 
 -- Enable Row Level Security
 alter table public.profiles enable row level security;

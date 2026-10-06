@@ -1,7 +1,9 @@
-import Head from 'next/head'
+import Seo from '../../components/Seo'
 import Link from 'next/link'
 import { useRouter } from 'next/router'
 import { useEffect, useState } from 'react'
+import { fetchMyProfile, MyProfile } from '../../lib/consultations'
+import { resolvePostLoginRoute } from '../../lib/postLogin'
 import { supabase } from '../../lib/supabase'
 
 export default function AuthCallback() {
@@ -59,31 +61,29 @@ export default function AuthCallback() {
 
       window.history.replaceState({}, '', '/auth/callback')
 
-      // 3) Route by profile.
-      const { data: profile, error: profileError } = await supabase
-        .from('profiles')
-        .select('role, active, role_chosen')
-        .eq('id', session.user.id)
-        .single()
+      // 3) Route by profile. El perfil (rol/estado) viene del backend (/auth/me), no de una lectura
+      // directa a `users`.
+      let profile: MyProfile
+      try {
+        profile = await fetchMyProfile(session.access_token)
+      } catch (e: any) {
+        if (cancelled) return
+        await supabase.auth.signOut()
+        setError(`No se pudo cargar tu perfil${e?.message ? `: ${e.message}` : ''}.`)
+        return
+      }
       if (cancelled) return
 
-      if (profileError || !profile) {
+      // El fan-out por rol vive en lib/postLogin.ts, compartido con /login: una sola copia de
+      // "¿a dónde va este usuario?" para que las dos puertas no vuelvan a divergir.
+      const route = resolvePostLoginRoute(profile)
+      if (cancelled) return
+      if (route.kind === 'blocked') {
         await supabase.auth.signOut()
-        setError(`No se pudo cargar tu perfil${profileError ? `: ${profileError.message}` : ''}.`)
+        setError(route.message)
         return
       }
-      if (!profile.role_chosen) {
-        router.replace('/elegir-rol')
-        return
-      }
-      if (!profile.active) {
-        await supabase.auth.signOut()
-        setError('Tu cuenta está desactivada. Contacta a un administrador.')
-        return
-      }
-      if (['admin', 'super_admin'].includes(profile.role)) router.replace('/admin/dashboard')
-      else if (['doctor', 'specialist'].includes(profile.role)) router.replace('/panel-medico')
-      else router.replace('/mi-caso')
+      router.replace(route.href)
     }
 
     run()
@@ -94,9 +94,12 @@ export default function AuthCallback() {
 
   return (
     <>
-      <Head>
-        <title>Acceso — Médicos por Venezuela</title>
-      </Head>
+      <Seo
+        titulo="Acceso — Médicos por Venezuela"
+        descripcion={'Validando tu sesión.'}
+        ruta="/auth/callback"
+        noindex
+      />
       <main className="page">
         <div className="narrow">
           <div className="card" style={{ marginTop: 14 }}>
@@ -111,7 +114,7 @@ export default function AuthCallback() {
                   </p>
                 )}
                 <Link
-                  href="/login-medico"
+                  href="/login"
                   className="link-button"
                   style={{ marginTop: 12, display: 'inline-block' }}
                 >

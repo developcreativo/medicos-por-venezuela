@@ -97,21 +97,22 @@ CLAUDE.md              assistant/codebase conventions
 
 ## Routes
 
-| Route                         | Purpose                                                                     |
-| ----------------------------- | --------------------------------------------------------------------------- |
-| `/`                           | Home — two cards: paciente / médico (no admin link)                         |
-| `/registro-paciente`          | Patient request form (public; optional account + Google)                    |
-| `/sala-espera`                | Patient confirmation; shows the video room link on screen                   |
-| `/registro-medico`            | Doctor self-registration (email+password or Google)                         |
-| `/elegir-rol`                 | First-time Google role picker (patient vs doctor)                           |
-| `/mi-caso`                    | Patient login + read-only case status                                       |
-| `/login-medico`               | Doctor login                                                                |
-| `/panel-medico`               | Doctor/admin panel — queue, claim case, active case visibility, counters    |
-| `/panel-medico/consulta/[id]` | Case detail page — patient details, video link, note, close/no-show actions |
-| `/auth/callback`              | OAuth redirect handler (routes by role / `role_chosen`)                     |
-| `/admin` (+ `/admin/login`)   | Private admin login (unlinked, `noindex`)                                   |
-| `/admin/dashboard`            | Admin dashboard — metrics, doctor revoke, case oversight                    |
-| `/api/videoconsulta`          | **Server** — creates/returns the Jitsi room for a consultation              |
+| Route                         | Purpose                                                                       |
+| ----------------------------- | ----------------------------------------------------------------------------- |
+| `/`                           | Home — two cards: paciente / médico (no admin link)                           |
+| `/registro-paciente`          | Patient request form (public; optional account + Google)                      |
+| `/sala-espera`                | Patient confirmation; shows the video room link on screen                     |
+| `/registro-medico`            | Doctor self-registration (email+password or Google)                           |
+| `/elegir-rol`                 | First-time Google role picker (patient vs doctor)                             |
+| `/login`                      | **Single sign-in for everyone** — routes by effective role after auth         |
+| `/mi-caso`                    | Patient portal — read-only case status (no login form; redirects to `/login`) |
+| `/login-medico`               | Legacy doctor login — redirects to `/login`                                   |
+| `/panel-medico`               | Doctor/admin panel — queue, claim case, active case visibility, counters      |
+| `/panel-medico/consulta/[id]` | Case detail page — patient details, video link, note, close/no-show actions   |
+| `/auth/callback`              | OAuth redirect handler (routes by role / `role_chosen`)                       |
+| `/admin` (+ `/admin/login`)   | Legacy admin entrance — redirects to `/login` (`noindex`)                     |
+| `/admin/dashboard`            | Admin dashboard — metrics, doctor revoke, case oversight                      |
+| `/api/videoconsulta`          | **Server** — creates/returns the Jitsi room for a consultation                |
 
 ---
 
@@ -123,7 +124,7 @@ CLAUDE.md              assistant/codebase conventions
 - **Doctors** self-register (email+password or Google) with **instant access** (`verified` + `active` set on
   signup). Admins can **revoke** a doctor anytime by setting `active = false` (instant cutoff via
   `current_user_role()`).
-- **Admins** are promoted manually via SQL. Private login at `/admin`.
+- **Admins** are promoted manually via SQL. They sign in at `/login` like everyone else.
 - **Google sign-in:** OAuth can't carry a role, so a first-time Google user gets a placeholder profile
   (`role_chosen = false`) and is routed to `/elegir-rol`. The choice is finalized by the `set_my_role` RPC,
   which can **never** grant admin/specialist.
@@ -151,11 +152,20 @@ Functions / RPCs:
 - `handle_new_auth_user()` — trigger; creates a `profiles` row from signup metadata (role-aware).
 - `set_my_role(...)` — RPC; lets a user finalize their own profile once (patient/doctor only).
 - `current_user_role()`, `is_admin()`, `is_staff()` — RLS helpers.
-- `mark_myself_online()` — RPC doctors call to update `last_seen_at`.
+- `mark_myself_online()` — **legacy/vestigial**: doctor online status now uses Supabase Realtime
+  **Presence** (`lib/presence.tsx`); nobody calls this RPC anymore (cleanup pending).
 - `mark_patient_waiting(uuid)` — RPC called by `/sala-espera` to update `patient_last_seen_at`.
 
 RLS is enabled on every table: anon can INSERT patients/consultations; account-holding patients read their
 own rows; staff read all; admins manage.
+
+**Cascading deletes:** the schema declares `consultations.patient_id` and
+`consultation_events.consultation_id` as `ON DELETE CASCADE`, so deleting a `patients` row also removes its
+consultations and audit events. **Note for existing databases:** `create table if not exists` does **not**
+fix a foreign key that was first created without cascade, so older DBs may still have `NO ACTION` and reject
+a patient delete with a `consultations_patient_id_fkey` violation. The schema now re-applies these
+constraints idempotently — **re-run [supabase_schema.sql](supabase_schema.sql)** to bring an existing
+database in line, after which patient deletes cascade automatically.
 
 ### Case claiming (concurrency)
 
@@ -173,7 +183,8 @@ sent to the dedicated case detail page (`/panel-medico/consulta/[id]`) to manage
 A submitted request is not the same as a patient actually waiting. While `/sala-espera` is open it calls the
 `mark_patient_waiting` RPC every ~20s, updating `consultations.patient_last_seen_at`. The doctor/admin panel
 polls the queue every ~20s and treats a patient as **present** only if seen within `PRESENCE_WINDOW_MS`
-(currently 5 minutes). Consequences:
+(currently 30 minutes — generous, because the heartbeat stops once the patient enters the Jitsi call and
+the waiting-room tab is backgrounded). Consequences:
 
 - The "En sala esperando" KPIs count only **present** patients. Each queue card shows **● En sala** or
   **○ Sin conexión**.
@@ -230,7 +241,7 @@ The "backend" is provisioned entirely in Supabase — there is no local server t
        full_name = 'Administrador principal'
    where email = 'YOUR_EMAIL@example.com';
    ```
-   Then log in at `/admin`.
+   Then log in at `/login` — the single sign-in routes an admin to `/admin/dashboard`.
 5. **Get API keys:** Supabase → Project Settings → API → copy the Project URL and anon key.
 
 ### Run the frontend locally
@@ -251,20 +262,22 @@ Set in `.env` for local dev and in Vercel for production. See [.env.example](.en
 
 **Browser-exposed (`NEXT_PUBLIC_*`) — safe; RLS enforces access:**
 
-| Var                             | Purpose                                        |
-| ------------------------------- | ---------------------------------------------- |
-| `NEXT_PUBLIC_SUPABASE_URL`      | Supabase project URL                           |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase anon key                              |
-| `NEXT_PUBLIC_JITSI_DOMAIN`      | Self-hosted Jitsi host (empty = `meet.jit.si`) |
-| `NEXT_PUBLIC_SUPPORT_WHATSAPP`  | Optional WhatsApp number shown on `/mi-caso`   |
+| Var                             | Purpose                                                                  |
+| ------------------------------- | ------------------------------------------------------------------------ |
+| `NEXT_PUBLIC_SUPABASE_URL`      | Supabase project URL                                                     |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase anon key                                                        |
+| `NEXT_PUBLIC_JITSI_DOMAIN`      | Jitsi host override (empty = self-hosted `meet.medicosporvenezuela.org`) |
+| `NEXT_PUBLIC_SUPPORT_WHATSAPP`  | Optional WhatsApp number shown on `/mi-caso`                             |
 
-**Server-only — NEVER prefix with `NEXT_PUBLIC`** (used by `/api/videoconsulta`):
+**Server-only — NEVER prefix with `NEXT_PUBLIC`, and do NOT set these in Amplify.** No runtime
+code reads them: the `/api/videoconsulta` route was removed and video rooms now come from the
+backend.
 
-| Var                                            | Purpose                                                |
-| ---------------------------------------------- | ------------------------------------------------------ |
-| `SUPABASE_SERVICE_ROLE_KEY`                    | Service-role key; lets the API route write video rooms |
-| `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN`     | Twilio creds (PARKED)                                  |
-| `TWILIO_WHATSAPP_NUMBER` / `TWILIO_SMS_NUMBER` | Twilio senders (PARKED)                                |
+| Var                                            | Purpose                                                                                      |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `SUPABASE_SERVICE_ROLE_KEY`                    | Local `.env` only — seeds the e2e doctors (`e2e/global-setup.ts`) against the LOCAL Supabase |
+| `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN`     | Twilio creds (PARKED)                                                                        |
+| `TWILIO_WHATSAPP_NUMBER` / `TWILIO_SMS_NUMBER` | Twilio senders (PARKED)                                                                      |
 
 ---
 
@@ -290,7 +303,62 @@ Set in `.env` for local dev and in Vercel for production. See [.env.example](.en
   case opens `/panel-medico/consulta/[id]`.
 - **Panel counters:** doctors see personal/specialty counters; admins see waiting/present/active-system
   counters. Returning from close/no-show actions refreshes the panel via `/panel-medico?actualizado=1`, and
-  the panel also refreshes on focus and polling.
+  the panel also refreshes on focus; the queue itself updates via Supabase Realtime
+  (`postgres_changes` on `consultations`) — no polling.
+
+### Jitsi troubleshooting — "calls don't connect with 2+ people"
+
+**Symptom:** patient and doctor can each open/join the room, but a 2-person call never connects (one person
+alone looks fine). This is **not** an app bug — the app gives both sides the same `video_room_url`. It is the
+self-hosted Jitsi server (DigitalOcean droplet) failing to allocate a media bridge.
+
+**Diagnose (SSH into the droplet):**
+
+```bash
+# The decisive log: if you see "There are no operational bridges" / "Can not invite participant",
+# jicofo has lost the videobridge.
+sudo grep -iE "no operational|lost a bridge|added new videobridge" /var/log/jitsi/jicofo.log | tail -n 3
+```
+
+A healthy result ends with **`Added new videobridge`** (no `Lost a bridge` after it). Joining the room is
+signaling (prosody/jicofo) and works even when broken; only **media allocation** needs the bridge, which is
+why one person alone seems OK.
+
+**Root cause we hit (2026-06):** a **boot-ordering race** — the videobridge connects to prosody before
+prosody has finished loading, gets stuck, and never re-registers (`jvb.log` shows
+`XMLStreamException: XML document structures must start and end within the same entity`, which is just the
+XMPP stream being cut). _Ruled out_ along the way: resources (droplet is idle, no swap), media/NAT/TURN
+(public IP is advertised and ICE-nominated correctly), and package version mismatch.
+
+**Immediate fix — ordered restart on the droplet:**
+
+```bash
+sudo systemctl restart prosody;             sleep 4
+sudo systemctl restart jicofo;              sleep 4
+sudo systemctl restart jitsi-videobridge2
+```
+
+Then re-run the health check above (expect `Added`) and confirm with a real 2-person call.
+
+**Permanent fix (applied):** a systemd drop-in makes the bridge wait for prosody on boot —
+`/etc/systemd/system/jitsi-videobridge2.service.d/override.conf`:
+
+```ini
+[Unit]
+After=prosody.service network-online.target
+Wants=prosody.service network-online.target
+
+[Service]
+ExecStartPre=/bin/sleep 15
+```
+
+After `sudo systemctl daemon-reload`, this survives `sudo reboot` (the bridge re-registers automatically).
+
+**Emergency stopgap (NO longer viable):** public `meet.jit.si` now forces the first participant to log
+in as moderator ("no moderators have yet arrived"), so falling back to it leaves patients stuck in the
+lobby. The app defaults to the self-hosted host and `browserRoomUrl` (lib/jitsi.ts) rewrites any legacy
+`meet.jit.si` room stored in the DB to the self-hosted instance when opening it. If the droplet is down,
+fix the droplet — there is no public fallback anymore.
 
 ---
 
@@ -302,7 +370,8 @@ Set in `.env` for local dev and in Vercel for production. See [.env.example](.en
   on it.
 - No service-role key is used client-side. Role escalation is prevented: profile updates are admin-only via
   RLS, and `set_my_role` only finalizes the caller's own profile once (patient/doctor, never admin).
-- Doctors update only `last_seen_at` via `mark_myself_online()`.
+- Doctor online status is Supabase Realtime **Presence** (app-level, no DB writes): only active
+  doctors `track` themselves and only staff subscribe (`lib/presence.tsx`).
 - Avoid storing full consultation conversations — keep only minimal operational data.
 - `/admin` is unlinked from the public UI and `noindex` — that is **not** access control; RLS + the
   admin-role check on the page are.

@@ -2,7 +2,10 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    # `dev_aws` es la rama de integración: todo entra por PR ahí y solo después va a `main`.
+    # Cuando el CI solo miraba `main`, cada PR se mergeaba a `dev_aws` SIN que nada verificara
+    # lint, formato, tipos ni build, y los fallos aparecían todos juntos en el PR de release.
+    branches: [main, dev_aws]
 
 jobs:
   lint-build:
@@ -22,6 +25,11 @@ jobs:
       - run: pnpm lint
 
       - run: pnpm format:check
+
+      # next-env.d.ts está gitignored, así que en un checkout limpio no existe y con él se
+      # pierde el `/// <reference types="next" />`: sin eso desaparece la ampliación de tipos
+      # de styled-jsx y todo `<style jsx>` falla. `typegen` lo regenera sin build completo.
+      - run: pnpm exec next typegen
 
       - run: pnpm exec tsc --noEmit
 

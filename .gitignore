@@ -16,7 +16,10 @@ next-env.d.ts
 .eslintcache
 
 # Local tooling
-.claude/
+# Claude Code: se versionan .claude/skills; solo se ignora lo local (misma regla que la API)
+.claude/settings.local.json
+.claude/*.local.json
+.playwright-mcp/
 
 # Logs
 *.log
@@ -25,3 +28,22 @@ npm-debug.log*
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Playwright
+/e2e/.auth/
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/.next-e2e/
+# Build manual fuera de `.next` (CLAUDE.md manda usarlo para no pisar el `.next` de un `next dev`
+# en marcha). ESLint ya lo ignoraba; sin esta línea, seguir esa instrucción deja el build entero
+# listo para commitear.
+/.next-build/
+
+# Material de origen del rediseño del home (agosto 2026): el prototipo de The Climb (10 MB), el
+# .docx del copy, la foto sin tocar (5 MB) y las fuentes en TTF. Es referencia para trabajar, no
+# se sirve ni se compila: lo que el sitio necesita ya está derivado en `public/` mediante
+# `scripts/build-fonts.mjs` y `scripts/optimize-hero-image.mjs`. Versionarlo metería 15 MB de
+# binarios en el historial para siempre.
+/nueva/
